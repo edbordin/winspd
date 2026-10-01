@@ -81,6 +81,13 @@ typedef struct _SPD_STORAGE_UNIT
     ULONG DispatcherThreadCount;
     DWORD DispatcherError;
     UINT32 DebugLog;
+    PVOID SharedRingAddress;
+    SIZE_T SharedRingSize;
+    SPD_RING_HEADER *SharedRingHeader;
+    UINT32 SharedRingCompletionBatchSize;
+    UINT32 SharedRingCompletionWaitMicroseconds;
+    SRWLOCK SharedRingRuntimeLock;
+    PVOID SharedRingRuntime;
 } SPD_STORAGE_UNIT;
 typedef struct _SPD_STORAGE_UNIT_OPERATION_CONTEXT
 {
@@ -135,6 +142,30 @@ VOID SpdStorageUnitShutdown(SPD_STORAGE_UNIT *StorageUnit);
  *     ERROR_SUCCESS or error code.
  */
 DWORD SpdStorageUnitStartDispatcher(SPD_STORAGE_UNIT *StorageUnit, ULONG ThreadCount);
+/**
+ * Process one transport-independent transaction.
+ *
+ * The request and response retain the canonical WinSpd transaction ABI;
+ * DataBuffer is the transport-resolved bulk buffer and may be NULL for
+ * bufferless operations. This is the common dispatch point used by legacy
+ * and alternate transports.
+ */
+BOOLEAN SpdStorageUnitProcessRequest(SPD_STORAGE_UNIT *StorageUnit,
+    SPD_IOCTL_TRANSACT_REQ *Request, PVOID DataBuffer,
+    SPD_IOCTL_TRANSACT_RSP *Response);
+/**
+ * Establish the driver-owned SharedRingV1 mapping for a storage unit.
+ * The caller supplies Version and requested ring dimensions; the driver
+ * fills UserAddress and SectionSize on success.
+ */
+DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
+    SPD_IOCTL_RING_OPEN_PARAMS *Params);
+/** Configure the maximum completion batch and optional coalescing timeout. */
+DWORD SpdStorageUnitSetSharedRingCompletionBatch(
+    SPD_STORAGE_UNIT *StorageUnit, UINT32 MaxBatchSize,
+    UINT32 MaxWaitMicroseconds);
+/** Close and unmap the SharedRingV1 mapping, if enabled. */
+VOID SpdStorageUnitCloseSharedRing(SPD_STORAGE_UNIT *StorageUnit);
 /**
  * Wait for the storage unit dispatcher to stop.
  *

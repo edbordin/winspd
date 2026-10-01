@@ -4,10 +4,11 @@ Class = SCSIAdapter
 ClassGuid = {4d36e97b-e325-11ce-bfc1-08002be10318}
 CatalogFile.ntx86 = !MyBaseName!-x86.cat
 CatalogFile.ntamd64 = !MyBaseName!-x64.cat
+CatalogFile.ntarm64 = !MyBaseName!-arm64.cat
 Provider = %MyCompanyName%
 
 [Manufacturer]
-%MyCompanyName% = model,ntx86,ntamd64
+%MyCompanyName% = model,ntx86,ntamd64,ntarm64
 
 [model.ntx86]
 %MyDescription% = install,%HardwareId%
@@ -15,11 +16,17 @@ Provider = %MyCompanyName%
 [model.ntamd64]
 %MyDescription% = install,%HardwareId%
 
+[model.ntarm64]
+%MyDescription% = install,%HardwareId%
+
 [install.ntx86]
 CopyFiles = sys.files.x86,dll.files.x86
 
 [install.ntamd64]
 CopyFiles = sys.files.x64,dll.files.x64,!DllFilesWow64!
+
+[install.ntarm64]
+CopyFiles = sys.files.arm64,dll.files.arm64
 
 [sys.files.x86]
 !MyBaseName!-x86.sys
@@ -33,11 +40,19 @@ CopyFiles = sys.files.x64,dll.files.x64,!DllFilesWow64!
 [dll.files.wow64]
 !MyBaseName!-x86.dll
 
+[sys.files.arm64]
+!MyBaseName!-arm64.sys
+[dll.files.arm64]
+!MyBaseName!-arm64.dll
+
 [install.ntx86.Services]
 AddService = !MyProductName!,%SPSVCINST_ASSOCSERVICE%,services.x86,eventlog.x86,"Application"
 
 [install.ntamd64.Services]
 AddService = !MyProductName!,%SPSVCINST_ASSOCSERVICE%,services.x64,eventlog.x64,"Application"
+
+[install.ntarm64.Services]
+AddService = !MyProductName!,%SPSVCINST_ASSOCSERVICE%,services.arm64,eventlog.arm64,"Application"
 
 [services.x86]
 DisplayName = !MyProductName!
@@ -57,6 +72,15 @@ ErrorControl = %SERVICE_ERROR_NORMAL%
 ServiceBinary = %12%\!MyBaseName!-x64.sys
 AddReg = reg.services
 
+[services.arm64]
+DisplayName = !MyProductName!
+Description = !MyDescription!
+ServiceType = %SERVICE_KERNEL_DRIVER%
+StartType = %SERVICE_DEMAND_START%
+ErrorControl = %SERVICE_ERROR_NORMAL%
+ServiceBinary = %12%\!MyBaseName!-arm64.sys
+AddReg = reg.services
+
 [reg.services]
 HKR,"Parameters","BusType",%REG_DWORD%,%BusTypeVirtual%
 
@@ -74,11 +98,20 @@ HKR,,"TypesSupported",%REG_DWORD%,7
 HKR,,"EventMessageFile",%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\!MyBaseName!-x64.dll"
 HKR,,"TypesSupported",%REG_DWORD%,7
 
+[eventlog.arm64]
+AddReg = reg.eventlog.arm64
+
+[reg.eventlog.arm64]
+HKR,,"EventMessageFile",%REG_EXPAND_SZ%,"%%SystemRoot%%\System32\!MyBaseName!-arm64.dll"
+HKR,,"TypesSupported",%REG_DWORD%,7
+
 [SourceDisksFiles]
 !MyBaseName!-x86.sys = 1
 !MyBaseName!-x86.dll = 1
 !MyBaseName!-x64.sys = 1
 !MyBaseName!-x64.dll = 1
+!MyBaseName!-arm64.sys = 1
+!MyBaseName!-arm64.dll = 1
 
 [SourceDisksNames]
 1 = %MyDescription%
@@ -89,6 +122,8 @@ dll.files.x86 = 11
 sys.files.x64 = 12
 dll.files.x64 = 11
 dll.files.wow64 = 16425
+sys.files.arm64 = 12
+dll.files.arm64 = 11
 
 [Strings]
 MyProductName = !MyProductName!

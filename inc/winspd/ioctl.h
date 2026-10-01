@@ -49,6 +49,11 @@ extern "C" {
 #define SPD_IOCTL_LIST                  ('l')
 #define SPD_IOCTL_TRANSACT              ('t')
 #define SPD_IOCTL_SET_TRANSACT_PID      ('i')
+#define SPD_IOCTL_RING_OPEN             ('r')
+#define SPD_IOCTL_RING_CLOSE            ('c')
+#define SPD_IOCTL_RING_STOP             ('s')
+#define SPD_IOCTL_RING_WAIT             ('w')
+#define SPD_IOCTL_RING_KICK             ('k')
 
 /* IOCTL_MINIPORT_PROCESS_SERVICE_IRP marshalling */
 #pragma warning(push)
@@ -74,8 +79,11 @@ typedef struct
     UINT32 CacheSupported:1;
     UINT32 UnmapSupported:1;
     UINT32 EjectDisabled:1;             /* disables UI eject */
+    UINT32 FuaSupported:1;              /* supports force-unit-access writes */
     UINT32 MaxTransferLength;
-    UINT64 Reserved[8];
+    UINT32 PhysicalBlockLength;          /* geometry; 0 means BlockLength */
+    UINT32 PhysicalBlockOffset;          /* byte offset of virtual LBA 0 */
+    UINT64 Reserved[7];
 } SPD_IOCTL_STORAGE_UNIT_PARAMS;
 #if defined(WINSPD_SYS_INTERNAL)
 static_assert(128 == sizeof(SPD_IOCTL_STORAGE_UNIT_PARAMS),
@@ -194,7 +202,117 @@ typedef struct
     UINT32 Btl;
     UINT32 ProcessId;
 } SPD_IOCTL_SET_TRANSACT_PID_PARAMS;
+
+/* SharedRingV1 transport ABI. The operation request/response structures
+ * above remain the canonical WinSpd transaction ABI. */
+#define SPD_RING_VERSION_1              1
+#define SPD_RING_NO_BUFFER              ((UINT32)-1)
+#define SPD_RING_MAX_SECTION_BYTES      (256ULL * 1024ULL * 1024ULL)
+
+typedef struct
+{
+    UINT32 Slot;
+    UINT32 Offset;
+    UINT32 Length;
+    UINT32 Flags;
+} SPD_RING_BUFFER_REF;
+#if defined(WINSPD_SYS_INTERNAL)
+static_assert(16 == sizeof(SPD_RING_BUFFER_REF),
+    "16 == sizeof(SPD_RING_BUFFER_REF)");
+#endif
+
+typedef struct
+{
+    SPD_IOCTL_TRANSACT_REQ Request;
+    SPD_RING_BUFFER_REF Data;
+} SPD_RING_REQUEST;
+
+typedef struct
+{
+    SPD_IOCTL_TRANSACT_RSP Response;
+} SPD_RING_COMPLETION;
+
+#if defined(WINSPD_SYS_INTERNAL)
+static_assert(sizeof(SPD_RING_REQUEST) ==
+    sizeof(SPD_IOCTL_TRANSACT_REQ) + sizeof(SPD_RING_BUFFER_REF),
+    "ring request must remain an envelope around the transaction request");
+static_assert(sizeof(SPD_RING_COMPLETION) == sizeof(SPD_IOCTL_TRANSACT_RSP),
+    "ring completion must preserve the transaction response ABI");
+#endif
+
+typedef struct
+{
+    UINT32 Version;
+    UINT32 HeaderSize;
+    UINT32 SubmissionOffset;
+    UINT32 SubmissionCount;
+    UINT32 CompletionOffset;
+    UINT32 CompletionCount;
+    UINT32 BufferOffset;
+    UINT32 BufferCount;
+    UINT32 BufferSize;
+    UINT32 Flags;
+    UINT64 SubmissionProducer;
+    UINT64 SubmissionConsumer;
+    UINT64 CompletionProducer;
+    UINT64 CompletionConsumer;
+    UINT64 KernelHeartbeat;
+    UINT64 UserHeartbeat;
+} SPD_RING_HEADER;
+
+typedef struct
+{
+    SPD_IOCTL_BASE_PARAMS Base;
+    UINT32 Btl;
+    UINT16 Version;
+    UINT16 Flags;
+    UINT32 SubmissionCount;
+    UINT32 CompletionCount;
+    UINT32 BufferCount;
+    UINT32 BufferSize;
+    UINT64 UserAddress;
+    UINT64 SectionSize;
+    UINT32 Features;
+    UINT32 Reserved;
+} SPD_IOCTL_RING_OPEN_PARAMS;
+
+typedef struct
+{
+    SPD_IOCTL_BASE_PARAMS Base;
+    UINT32 Btl;
+    UINT32 Reserved;
+} SPD_IOCTL_RING_CLOSE_PARAMS;
+
+typedef struct
+{
+    SPD_IOCTL_BASE_PARAMS Base;
+    UINT32 Btl;
+    UINT32 MaxRequests;
+    UINT32 Produced;
+    UINT32 Reserved;
+} SPD_IOCTL_RING_WAIT_PARAMS;
+
+typedef struct
+{
+    SPD_IOCTL_BASE_PARAMS Base;
+    UINT32 Btl;
+    UINT32 Consumed;
+    UINT32 Reserved[2];
+} SPD_IOCTL_RING_KICK_PARAMS;
 #pragma warning(pop)
+
+/* These helpers deliberately use interlocked operations rather than volatile
+ * as the synchronization mechanism for counters shared by kernel and user. */
+static inline UINT64 SpdRingLoadCounter(UINT64 *Counter)
+{
+    return (UINT64)InterlockedCompareExchange64(
+        (volatile LONG64 *)Counter, 0, 0);
+}
+
+static inline VOID SpdRingStoreCounter(UINT64 *Counter, UINT64 Value)
+{
+    InterlockedExchange64((volatile LONG64 *)Counter, (LONG64)Value);
+}
 
 #if !defined(WINSPD_SYS_INTERNAL)
 DWORD SpdIoctlGetDevicePath(GUID *ClassGuid, PWSTR DeviceName,
@@ -219,6 +337,14 @@ DWORD SpdIoctlTransact(HANDLE DeviceHandle,
 DWORD SpdIoctlSetTransactProcessId(HANDLE DeviceHandle,
     UINT32 Btl,
     ULONG ProcessId);
+DWORD SpdIoctlRingOpen(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_OPEN_PARAMS *Params);
+DWORD SpdIoctlRingClose(HANDLE DeviceHandle, UINT32 Btl);
+DWORD SpdIoctlRingStop(HANDLE DeviceHandle, UINT32 Btl);
+DWORD SpdIoctlRingWait(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_WAIT_PARAMS *Params);
+DWORD SpdIoctlRingKick(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_KICK_PARAMS *Params);
 #endif
 
 #ifdef __cplusplus

@@ -568,3 +568,41 @@ DWORD SpdStorageUnitHandleClose(HANDLE Handle)
     else
         return CloseHandle(GetDeviceHandle(Handle)) ? 0 : GetLastError();
 }
+
+DWORD SpdStorageUnitHandleRingOpen(HANDLE Handle,
+    UINT32 Btl, SPD_IOCTL_RING_OPEN_PARAMS *Params)
+{
+    if (IsPipeHandle(Handle))
+        return ERROR_NOT_SUPPORTED;
+    return SpdIoctlRingOpen(GetDeviceHandle(Handle), Btl, Params);
+}
+
+DWORD SpdStorageUnitHandleRingClose(HANDLE Handle, UINT32 Btl)
+{
+    if (IsPipeHandle(Handle))
+        return ERROR_NOT_SUPPORTED;
+    return SpdIoctlRingClose(GetDeviceHandle(Handle), Btl);
+}
+
+DWORD SpdStorageUnitHandleRingStop(HANDLE Handle, UINT32 Btl)
+{
+    if (IsPipeHandle(Handle))
+        return ERROR_NOT_SUPPORTED;
+    return SpdIoctlRingStop(GetDeviceHandle(Handle), Btl);
+}
+
+DWORD SpdStorageUnitHandleRingWait(HANDLE Handle,
+    UINT32 Btl, SPD_IOCTL_RING_WAIT_PARAMS *Params)
+{
+    if (IsPipeHandle(Handle))
+        return ERROR_NOT_SUPPORTED;
+    return SpdIoctlRingWait(GetDeviceHandle(Handle), Btl, Params);
+}
+
+DWORD SpdStorageUnitHandleRingKick(HANDLE Handle,
+    UINT32 Btl, SPD_IOCTL_RING_KICK_PARAMS *Params)
+{
+    if (IsPipeHandle(Handle))
+        return ERROR_NOT_SUPPORTED;
+    return SpdIoctlRingKick(GetDeviceHandle(Handle), Btl, Params);
+}

@@ -7,6 +7,7 @@ set vcvarsall="%~dp0vcvarsall.bat"
 
 if "%1"=="x64" set OsVer=7_X64,8_X64,6_3_X64,10_X64,Server2008R2_X64,Server8_X64,Server6_3_X64,Server10_X64
 if "%1"=="x86" set OsVer=7_X86,8_X86,6_3_X86,10_X86
+if "%1"=="arm64" set OsVer=10_GE_ARM64,Server2025_ARM64
 if "%OsVer%"=="" goto usage
 shift
 
@@ -28,7 +29,7 @@ set RegKey="HKLM\SOFTWARE\Microsoft\Windows Kits\Installed Roots"
 set RegVal="KitsRoot10"
 reg query %RegKey% /v %RegVal% >nul 2>&1 || (echo Cannot find Windows Kit >&2 & exit /b 1)
 for /f "tokens=2,*" %%i in ('reg query %RegKey% /v %RegVal% ^| findstr %RegVal%') do (
-    set KitRoot="%%j"
+    set "KitRoot=%%j"
 )
 
 set TempDir=%TMP%\mkcat-%RANDOM%
@@ -42,7 +43,10 @@ if not "%1"=="" (
     goto copyloop
 )
 echo inf2cat /driver:%TempDir% /os:%OsVer% /uselocaltime
-%KitRoot%\bin\x86\inf2cat /driver:%TempDir% /os:%OsVer% /uselocaltime
+set Inf2Cat=
+for /f "delims=" %%i in ('dir /b /ad /o-n "%KitRoot%bin\10.*" 2^>nul') do if exist "%KitRoot%bin\%%i\x86\Inf2Cat.exe" if not defined Inf2Cat set "Inf2Cat=%KitRoot%bin\%%i\x86\Inf2Cat.exe"
+if not defined Inf2Cat (echo Cannot find Inf2Cat >&2 & goto fail)
+"%Inf2Cat%" /driver:%TempDir% /os:%OsVer% /uselocaltime
 if errorlevel 1 goto fail
 if not "%CertFile%"=="" (
     for /F "delims=" %%l in ('certutil -dump "%CertFile%" ^| findstr /I /C:"Cert Hash(sha1)"') do (

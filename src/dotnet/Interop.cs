@@ -37,6 +37,7 @@ namespace Spd.Interop
         internal const UInt32 CacheSupported = 0x00000002;
         internal const UInt32 UnmapSupported = 0x00000004;
         internal const UInt32 EjectDisabled = 0x00000008;
+        internal const UInt32 FuaSupported = 0x00000010;
         internal const int GuidSize = 16;
         internal const int ProductIdSize = 16;
         internal const int ProductRevisionLevelSize = 4;
@@ -49,7 +50,9 @@ namespace Spd.Interop
         internal Byte DeviceType;
         internal UInt32 Flags;
         internal UInt32 MaxTransferLength;
-        internal unsafe fixed UInt64 Reserved[8];
+        internal UInt32 PhysicalBlockLength;
+        internal UInt32 PhysicalBlockOffset;
+        internal unsafe fixed UInt64 Reserved[7];
 
         internal unsafe System.Guid GetGuid()
         {

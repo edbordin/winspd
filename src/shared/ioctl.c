@@ -501,3 +501,139 @@ DWORD SpdIoctlSetTransactProcessId(HANDLE DeviceHandle,
 exit:
     return Error;
 }
+
+DWORD SpdIoctlRingOpen(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_OPEN_PARAMS *Params)
+{
+    DWORD BytesTransferred;
+    DWORD Error;
+
+    Params->Base.Size = sizeof *Params;
+    Params->Base.Code = SPD_IOCTL_RING_OPEN;
+    Params->Btl = Btl;
+
+    if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        Params, sizeof *Params,
+        Params, sizeof *Params,
+        &BytesTransferred, 0))
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    if (sizeof *Params != BytesTransferred)
+    {
+        Error = ERROR_INVALID_DATA;
+        goto exit;
+    }
+
+    Error = ERROR_SUCCESS;
+
+exit:
+    return Error;
+}
+
+DWORD SpdIoctlRingClose(HANDLE DeviceHandle, UINT32 Btl)
+{
+    SPD_IOCTL_RING_CLOSE_PARAMS Params;
+    DWORD BytesTransferred;
+    DWORD Error;
+
+    memset(&Params, 0, sizeof Params);
+    Params.Base.Size = sizeof Params;
+    Params.Base.Code = SPD_IOCTL_RING_CLOSE;
+    Params.Btl = Btl;
+
+    if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        &Params, sizeof Params,
+        0, 0,
+        &BytesTransferred, 0))
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    Error = ERROR_SUCCESS;
+
+exit:
+    return Error;
+}
+
+DWORD SpdIoctlRingStop(HANDLE DeviceHandle, UINT32 Btl)
+{
+    SPD_IOCTL_RING_CLOSE_PARAMS Params;
+    DWORD BytesTransferred;
+
+    memset(&Params, 0, sizeof Params);
+    Params.Base.Size = sizeof Params;
+    Params.Base.Code = SPD_IOCTL_RING_STOP;
+    Params.Btl = Btl;
+
+    if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        &Params, sizeof Params, 0, 0, &BytesTransferred, 0))
+        return GetLastError();
+
+    return ERROR_SUCCESS;
+}
+
+DWORD SpdIoctlRingWait(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_WAIT_PARAMS *Params)
+{
+    DWORD BytesTransferred;
+    DWORD Error;
+
+    Params->Base.Size = sizeof *Params;
+    Params->Base.Code = SPD_IOCTL_RING_WAIT;
+    Params->Btl = Btl;
+
+    if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        Params, sizeof *Params,
+        Params, sizeof *Params,
+        &BytesTransferred, 0))
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    if (sizeof *Params != BytesTransferred)
+    {
+        Error = ERROR_INVALID_DATA;
+        goto exit;
+    }
+
+    Error = ERROR_SUCCESS;
+
+exit:
+    return Error;
+}
+
+DWORD SpdIoctlRingKick(HANDLE DeviceHandle,
+    UINT32 Btl, SPD_IOCTL_RING_KICK_PARAMS *Params)
+{
+    DWORD BytesTransferred;
+    DWORD Error;
+
+    Params->Base.Size = sizeof *Params;
+    Params->Base.Code = SPD_IOCTL_RING_KICK;
+    Params->Btl = Btl;
+
+    if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        Params, sizeof *Params,
+        Params, sizeof *Params,
+        &BytesTransferred, 0))
+    {
+        Error = GetLastError();
+        goto exit;
+    }
+
+    if (sizeof *Params != BytesTransferred)
+    {
+        Error = ERROR_INVALID_DATA;
+        goto exit;
+    }
+
+    Error = ERROR_SUCCESS;
+
+exit:
+    return Error;
+}

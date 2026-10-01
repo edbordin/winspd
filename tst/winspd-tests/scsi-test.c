@@ -229,7 +229,8 @@ static void scsi_inquiry_test(void)
     scsi_inquiry_dotest(TRUE);
 }
 
-static void scsi_mode_sense_dotest(BOOLEAN WriteProtected, BOOLEAN CacheSupported)
+static void scsi_mode_sense_dotest(
+    BOOLEAN WriteProtected, BOOLEAN CacheSupported, BOOLEAN FuaSupported)
 {
     SPD_IOCTL_STORAGE_UNIT_PARAMS StorageUnitParams;
     HANDLE DeviceHandle;
@@ -256,6 +257,7 @@ static void scsi_mode_sense_dotest(BOOLEAN WriteProtected, BOOLEAN CacheSupporte
     StorageUnitParams.MaxTransferLength = 512;
     StorageUnitParams.WriteProtected = !!WriteProtected;
     StorageUnitParams.CacheSupported = !!CacheSupported;
+    StorageUnitParams.FuaSupported = !!FuaSupported;
     Error = SpdIoctlProvision(DeviceHandle, &StorageUnitParams, &Btl);
     ASSERT(ERROR_SUCCESS == Error);
     ASSERT(0 == Btl);
@@ -288,7 +290,7 @@ static void scsi_mode_sense_dotest(BOOLEAN WriteProtected, BOOLEAN CacheSupporte
         PMODE_PARAMETER_HEADER ModeParameterHeader = (PVOID)DataBuffer;
         ASSERT(0 == ModeParameterHeader->MediumType);
         ASSERT(
-            ((WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) | (CacheSupported ? MODE_DSP_FUA_SUPPORTED : 0)) ==
+            ((WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) | (FuaSupported ? MODE_DSP_FUA_SUPPORTED : 0)) ==
             ModeParameterHeader->DeviceSpecificParameter);
         ASSERT(0 == ModeParameterHeader->BlockDescriptorLength);
 
@@ -314,7 +316,7 @@ static void scsi_mode_sense_dotest(BOOLEAN WriteProtected, BOOLEAN CacheSupporte
         PMODE_PARAMETER_HEADER10 ModeParameterHeader = (PVOID)DataBuffer;
         ASSERT(0 == ModeParameterHeader->MediumType);
         ASSERT(
-            ((WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) | (CacheSupported ? MODE_DSP_FUA_SUPPORTED : 0)) ==
+            ((WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) | (FuaSupported ? MODE_DSP_FUA_SUPPORTED : 0)) ==
             ModeParameterHeader->DeviceSpecificParameter);
         ASSERT(
             0 == ModeParameterHeader->BlockDescriptorLength[0] &&
@@ -336,9 +338,10 @@ static void scsi_mode_sense_dotest(BOOLEAN WriteProtected, BOOLEAN CacheSupporte
 
 static void scsi_mode_sense_test(void)
 {
-    scsi_mode_sense_dotest(FALSE, FALSE);
-    scsi_mode_sense_dotest(FALSE, TRUE);
-    scsi_mode_sense_dotest(TRUE, FALSE);
+    scsi_mode_sense_dotest(FALSE, FALSE, FALSE);
+    scsi_mode_sense_dotest(FALSE, TRUE, FALSE);
+    scsi_mode_sense_dotest(FALSE, TRUE, TRUE);
+    scsi_mode_sense_dotest(TRUE, FALSE, FALSE);
 }
 
 static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported)
