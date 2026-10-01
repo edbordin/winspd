@@ -22,6 +22,9 @@
     <ClCompile Include="..\..\..\tst\winspd-tests\scsi-test.c">
       <Filter>Source</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\..\tst\winspd-tests\ring-test.c">
+      <Filter>Source</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\..\ext\tlib\testsuite.h">

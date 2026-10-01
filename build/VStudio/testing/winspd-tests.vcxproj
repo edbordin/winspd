@@ -181,6 +181,7 @@
     </ClCompile>
     <ClCompile Include="..\..\..\tst\winspd-tests\ioctl-test.c" />
     <ClCompile Include="..\..\..\tst\winspd-tests\scsi-test.c" />
+    <ClCompile Include="..\..\..\tst\winspd-tests\ring-test.c" />
     <ClCompile Include="..\..\..\tst\winspd-tests\winspd-tests.c" />
   </ItemGroup>
   <ItemGroup>

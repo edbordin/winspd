@@ -23,7 +23,6 @@ EXPORTS
     SpdStorageUnitProcessRequest
     SpdStorageUnitOpenSharedRing
     SpdStorageUnitCloseSharedRing
-    SpdStorageUnitSetSharedRingCompletionBatch
     SpdStorageUnitWaitDispatcher
     SpdStorageUnitSendResponse
     SpdStorageUnitGetOperationContext

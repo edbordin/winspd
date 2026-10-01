@@ -245,11 +245,9 @@ typedef struct
     UINT32 Version;
     UINT32 HeaderSize;
     UINT32 SubmissionOffset;
-    UINT32 SubmissionCount;
     UINT32 CompletionOffset;
-    UINT32 CompletionCount;
     UINT32 BufferOffset;
-    UINT32 BufferCount;
+    UINT32 QueueDepth;
     UINT32 BufferSize;
     UINT32 Flags;
     UINT64 SubmissionProducer;
@@ -266,9 +264,7 @@ typedef struct
     UINT32 Btl;
     UINT16 Version;
     UINT16 Flags;
-    UINT32 SubmissionCount;
-    UINT32 CompletionCount;
-    UINT32 BufferCount;
+    UINT32 QueueDepth;
     UINT32 BufferSize;
     UINT64 UserAddress;
     UINT64 SectionSize;
@@ -287,9 +283,8 @@ typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
-    UINT32 MaxRequests;
     UINT32 Produced;
-    UINT32 Reserved;
+    UINT32 Reserved[2];
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct

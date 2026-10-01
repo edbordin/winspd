@@ -344,7 +344,8 @@ static void scsi_mode_sense_test(void)
     scsi_mode_sense_dotest(TRUE, FALSE, FALSE);
 }
 
-static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported)
+static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported,
+    UINT32 PhysicalBlockLength, UINT32 PhysicalBlockOffset)
 {
     SPD_IOCTL_STORAGE_UNIT_PARAMS StorageUnitParams;
     HANDLE DeviceHandle;
@@ -368,6 +369,8 @@ static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported)
     //memcpy(StorageUnitParams.ProductRevisionLevel, "0.1 ", 4);
     StorageUnitParams.BlockCount = 16;
     StorageUnitParams.BlockLength = 512;
+    StorageUnitParams.PhysicalBlockLength = PhysicalBlockLength;
+    StorageUnitParams.PhysicalBlockOffset = PhysicalBlockOffset;
     StorageUnitParams.MaxTransferLength = 512;
     StorageUnitParams.UnmapSupported = !!UnmapSupported;
     Error = SpdIoctlProvision(DeviceHandle, &StorageUnitParams, &Btl);
@@ -436,6 +439,12 @@ static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported)
             (((PUINT8)&ReadCapacityData->BytesPerBlock)[2] << 8) |
             (((PUINT8)&ReadCapacityData->BytesPerBlock)[3])));
         ASSERT((UnmapSupported ? 1 : 0) == ReadCapacityData->LBPME);
+        if (4096 == PhysicalBlockLength && 512 == PhysicalBlockOffset)
+        {
+            ASSERT(3 == ReadCapacityData->LogicalPerPhysicalExponent);
+            ASSERT(0 == ReadCapacityData->LowestAlignedBlock_MSB);
+            ASSERT(7 == ReadCapacityData->LowestAlignedBlock_LSB);
+        }
     }
 
     Error = SpdIoctlUnprovision(DeviceHandle, &StorageUnitParams.Guid);
@@ -447,8 +456,9 @@ static void scsi_read_capacity_dotest(BOOLEAN UnmapSupported)
 
 static void scsi_read_capacity_test(void)
 {
-    scsi_read_capacity_dotest(FALSE);
-    scsi_read_capacity_dotest(TRUE);
+    scsi_read_capacity_dotest(FALSE, 0, 0);
+    scsi_read_capacity_dotest(TRUE, 0, 0);
+    scsi_read_capacity_dotest(FALSE, 4096, 512);
 }
 
 void scsi_tests(void)
