@@ -426,7 +426,7 @@ static UCHAR SpdScsiModeSense(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUn
         ModeParameterHeader->MediumType = 0;
         ModeParameterHeader->DeviceSpecificParameter =
             (StorageUnit->StorageUnitParams.WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) |
-            (StorageUnit->StorageUnitParams.CacheSupported ? MODE_DSP_FUA_SUPPORTED : 0);
+            (StorageUnit->StorageUnitParams.FuaSupported ? MODE_DSP_FUA_SUPPORTED : 0);
         ModeParameterHeader->BlockDescriptorLength = 0;
     }
     else
@@ -450,7 +450,7 @@ static UCHAR SpdScsiModeSense(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUn
         ModeParameterHeader->MediumType = 0;
         ModeParameterHeader->DeviceSpecificParameter =
             (StorageUnit->StorageUnitParams.WriteProtected ? MODE_DSP_WRITE_PROTECT : 0) |
-            (StorageUnit->StorageUnitParams.CacheSupported ? MODE_DSP_FUA_SUPPORTED : 0);
+            (StorageUnit->StorageUnitParams.FuaSupported ? MODE_DSP_FUA_SUPPORTED : 0);
         ModeParameterHeader->BlockDescriptorLength[0] = 0;
         ModeParameterHeader->BlockDescriptorLength[1] = 0;
     }
@@ -525,6 +525,23 @@ static UCHAR SpdScsiReadCapacity(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
         ((PUINT8)&ReadCapacityData->BytesPerBlock)[1] = (U32 >> 16) & 0xff;
         ((PUINT8)&ReadCapacityData->BytesPerBlock)[2] = (U32 >> 8) & 0xff;
         ((PUINT8)&ReadCapacityData->BytesPerBlock)[3] = U32 & 0xff;
+
+        U32 = StorageUnit->StorageUnitParams.PhysicalBlockLength;
+        if (0 == U32)
+            U32 = StorageUnit->StorageUnitParams.BlockLength;
+        U32 /= StorageUnit->StorageUnitParams.BlockLength;
+        ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LogicalPerPhysicalExponent = 0;
+        while (1 < U32)
+        {
+            ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LogicalPerPhysicalExponent++;
+            U32 >>= 1;
+        }
+        U32 = StorageUnit->StorageUnitParams.PhysicalBlockOffset /
+            StorageUnit->StorageUnitParams.BlockLength;
+        ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LowestAlignedBlock_MSB =
+            (U32 >> 8) & 0x3f;
+        ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LowestAlignedBlock_LSB =
+            U32 & 0xff;
 
         ULONG DataLength;
         if (sizeof(READ_CAPACITY16_DATA) <= DataTransferLength)
@@ -726,7 +743,9 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
             &Req->Op.Write.BlockCount,
             &ForceUnitAccess);
         Req->Op.Write.ForceUnitAccess =
-            StorageUnit->StorageUnitParams.CacheSupported ? ForceUnitAccess : 1;
+            StorageUnit->StorageUnitParams.CacheSupported &&
+            StorageUnit->StorageUnitParams.FuaSupported ? ForceUnitAccess :
+            !StorageUnit->StorageUnitParams.CacheSupported;
         ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
         if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
             ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;

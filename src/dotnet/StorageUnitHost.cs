@@ -125,6 +125,22 @@ namespace Spd
             set { _StorageUnitParams.BlockLength = value; }
         }
         /// <summary>
+        /// Gets or sets the physical block length. Zero uses BlockLength.
+        /// </summary>
+        public UInt32 PhysicalBlockLength
+        {
+            get { return _StorageUnitParams.PhysicalBlockLength; }
+            set { _StorageUnitParams.PhysicalBlockLength = value; }
+        }
+        /// <summary>
+        /// Gets or sets the byte offset of virtual LBA 0 within its physical block.
+        /// </summary>
+        public UInt32 PhysicalBlockOffset
+        {
+            get { return _StorageUnitParams.PhysicalBlockOffset; }
+            set { _StorageUnitParams.PhysicalBlockOffset = value; }
+        }
+        /// <summary>
         /// Gets or sets the storage unit product name/ID.
         /// </summary>
         public String ProductId
@@ -171,6 +187,14 @@ namespace Spd
         {
             get { return 0 != (_StorageUnitParams.Flags & StorageUnitParams.EjectDisabled); }
             set { _StorageUnitParams.Flags |= (value ? StorageUnitParams.EjectDisabled : 0); }
+        }
+        /// <summary>
+        /// Gets or sets a value that determines whether the storage unit supports FUA writes.
+        /// </summary>
+        public Boolean FuaSupported
+        {
+            get { return 0 != (_StorageUnitParams.Flags & StorageUnitParams.FuaSupported); }
+            set { _StorageUnitParams.Flags |= (value ? StorageUnitParams.FuaSupported : 0); }
         }
         /// <summary>
         /// Gets or sets the storage unit maximum transfer length for a single operation.

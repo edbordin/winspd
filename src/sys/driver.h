@@ -136,7 +136,11 @@ const char *SrbStringize(PVOID Srb, char Buffer[], size_t Size);
     } while (0,0)
 
 /* memory allocation */
+#if defined(_ARM64_) || defined(_ARM64)
+#define SpdAllocNonPaged(Size, Tag)     ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, Tag)
+#else
 #define SpdAllocNonPaged(Size, Tag)     ExAllocatePoolWithTag(NonPagedPool, Size, Tag)
+#endif
 #define SpdFree(Pointer, Tag)           ExFreePoolWithTag(Pointer, Tag)
 #define SpdTagStorageUnit               'SdpS'
 #define SpdTagIoq                       'QdpS'
@@ -337,6 +341,10 @@ NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP Can
 VOID SpdIoqEndProcessingSrb(SPD_IOQ *Ioq, UINT64 Hint,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
+VOID SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+    PVOID SrbExtension,
+    UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
+    PVOID Context, PVOID DataBuffer);
 typedef struct _SPD_SRB_EXTENSION
 {
     struct _SPD_STORAGE_UNIT *StorageUnit;
@@ -348,6 +356,16 @@ typedef struct _SPD_SRB_EXTENSION
     ULONG ChunkOffset;
 } SPD_SRB_EXTENSION;
 #define SpdSrbExtension(Srb)            ((SPD_SRB_EXTENSION *)SrbGetMiniportContext(Srb))
+
+typedef struct
+{
+    PVOID SrbExtension;
+    UINT64 Token;
+    UINT32 BufferSlot;
+    UINT32 DataLength;
+    UINT8 Kind;
+    BOOLEAN InUse;
+} SPD_RING_PENDING;
 
 /* storage units */
 typedef struct _SPD_STORAGE_UNIT SPD_STORAGE_UNIT;
@@ -370,6 +388,28 @@ typedef struct _SPD_STORAGE_UNIT
     /* fields not protected */
     PDEVICE_OBJECT DeviceObject;        /* disk device */
     ULONG TransactProcessId;
+    HANDLE RingSectionHandle;
+    PVOID RingSystemAddress;
+    PMDL RingMdl;
+    SIZE_T RingSectionSize;
+    PVOID RingUserAddress;
+    ULONG RingProcessId;
+    KSPIN_LOCK RingLock;
+    KEVENT RingIdleEvent;
+    ULONG RingActiveCalls;
+    BOOLEAN RingWaitActive;
+    BOOLEAN RingClosing;
+    BOOLEAN RingFailed;
+    UINT32 RingGeneration;
+    UINT32 RingSubmissionOffset;
+    UINT32 RingSubmissionCount;
+    UINT32 RingCompletionOffset;
+    UINT32 RingCompletionCount;
+    UINT32 RingBufferOffset;
+    UINT32 RingBufferCount;
+    UINT32 RingBufferSize;
+    UINT32 RingPendingCount;
+    SPD_RING_PENDING *RingPending;
 } SPD_STORAGE_UNIT;
 NTSTATUS SpdDeviceExtensionInit(SPD_DEVICE_EXTENSION *DeviceExtension, PVOID BusInformation);
 VOID SpdDeviceExtensionFini(SPD_DEVICE_EXTENSION *DeviceExtension);
@@ -384,6 +424,25 @@ NTSTATUS SpdStorageUnitUnprovision(
     SPD_DEVICE_EXTENSION *DeviceExtension,
     PGUID Guid, ULONG Index,
     ULONG ProcessId);
+NTSTATUS SpdStorageUnitRingOpen(
+    SPD_STORAGE_UNIT *StorageUnit,
+    ULONG ProcessId,
+    SPD_IOCTL_RING_OPEN_PARAMS *Params);
+VOID SpdStorageUnitRingClose(
+    SPD_STORAGE_UNIT *StorageUnit,
+    BOOLEAN UserProcessExiting);
+NTSTATUS SpdStorageUnitRingStop(
+    SPD_STORAGE_UNIT *StorageUnit,
+    ULONG ProcessId);
+NTSTATUS SpdStorageUnitRingWait(
+    SPD_STORAGE_UNIT *StorageUnit,
+    ULONG ProcessId,
+    SPD_IOCTL_RING_WAIT_PARAMS *Params,
+    PIRP Irp);
+NTSTATUS SpdStorageUnitRingKick(
+    SPD_STORAGE_UNIT *StorageUnit,
+    ULONG ProcessId,
+    SPD_IOCTL_RING_KICK_PARAMS *Params);
 SPD_STORAGE_UNIT *SpdStorageUnitReferenceByBtl(
     SPD_DEVICE_EXTENSION *DeviceExtension,
     UINT32 Btl);

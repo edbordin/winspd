@@ -21,6 +21,22 @@
 
 #include <sys/driver.h>
 
+static BOOLEAN SpdValidPhysicalBlockLength(UINT32 LogicalLength,
+    UINT32 PhysicalLength, UINT32 PhysicalOffset)
+{
+    if (0 == PhysicalLength)
+        return 0 == PhysicalOffset;
+    if (0 == LogicalLength || PhysicalLength < LogicalLength ||
+        0 != PhysicalLength % LogicalLength ||
+        PhysicalOffset >= PhysicalLength ||
+        0 != PhysicalOffset % LogicalLength ||
+        PhysicalOffset / LogicalLength > 0x3fff)
+        return FALSE;
+
+    PhysicalLength /= LogicalLength;
+    return 0 == (PhysicalLength & (PhysicalLength - 1));
+}
+
 static VOID SpdIoctlProvision(SPD_DEVICE_EXTENSION *DeviceExtension,
     ULONG InputBufferLength, ULONG OutputBufferLength, SPD_IOCTL_PROVISION_PARAMS *Params,
     PIRP Irp)
@@ -40,7 +56,11 @@ static VOID SpdIoctlProvision(SPD_DEVICE_EXTENSION *DeviceExtension,
         DIRECT_ACCESS_DEVICE != Params->Dir.Par.StorageUnitParams.DeviceType ||
         0 == Params->Dir.Par.StorageUnitParams.MaxTransferLength ||
         0 != Params->Dir.Par.StorageUnitParams.MaxTransferLength %
-            Params->Dir.Par.StorageUnitParams.BlockLength)
+            Params->Dir.Par.StorageUnitParams.BlockLength ||
+        !SpdValidPhysicalBlockLength(
+            Params->Dir.Par.StorageUnitParams.BlockLength,
+            Params->Dir.Par.StorageUnitParams.PhysicalBlockLength,
+            Params->Dir.Par.StorageUnitParams.PhysicalBlockOffset))
     {
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
         goto exit;
@@ -211,7 +231,8 @@ static VOID SpdIoctlTransact(SPD_DEVICE_EXTENSION *DeviceExtension,
         /* wait for an SRB to arrive */
         while (STATUS_UNSUCCESSFUL == (Irp->IoStatus.Status =
             SpdIoqStartProcessingSrb(StorageUnit->Ioq,
-                0, Irp, SpdSrbExecuteScsiPrepare, &Params->Dir.Req, DataBuffer)))
+                0, Irp, SpdSrbExecuteScsiPrepare, &Params->Dir.Req,
+                DataBuffer)))
         {
             if (SpdIoqStopped(StorageUnit->Ioq))
             {
@@ -270,6 +291,165 @@ exit:;
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 }
 
+static VOID SpdIoctlRingOpen(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, ULONG OutputBufferLength,
+    SPD_IOCTL_RING_OPEN_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    ULONG ProcessId = IoGetRequestorProcessId(Irp);
+
+    if (sizeof *Params > InputBufferLength ||
+        sizeof *Params > OutputBufferLength)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    if (ProcessId != StorageUnit->TransactProcessId)
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+    else
+    {
+        Irp->IoStatus.Status = SpdStorageUnitRingOpen(StorageUnit,
+            ProcessId, Params);
+        if (NT_SUCCESS(Irp->IoStatus.Status))
+            Irp->IoStatus.Information = sizeof *Params;
+    }
+
+exit:;
+    if (0 != StorageUnit)
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+static VOID SpdIoctlRingClose(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, SPD_IOCTL_RING_CLOSE_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    ULONG ProcessId = IoGetRequestorProcessId(Irp);
+
+    if (sizeof *Params > InputBufferLength)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    if (ProcessId != StorageUnit->TransactProcessId)
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+    else
+    {
+        /* Ring close is final for this storage unit. Wake any blocked WAIT
+         * and abort user-owned requests before the shared state is unmapped. */
+        SpdIoqReset(StorageUnit->Ioq, TRUE);
+        SpdStorageUnitRingClose(StorageUnit, FALSE);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+    }
+
+exit:;
+    if (0 != StorageUnit)
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+static VOID SpdIoctlRingStop(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, SPD_IOCTL_RING_CLOSE_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    ULONG ProcessId = IoGetRequestorProcessId(Irp);
+
+    if (sizeof *Params > InputBufferLength)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    Irp->IoStatus.Status = SpdStorageUnitRingStop(StorageUnit, ProcessId);
+
+exit:;
+    if (0 != StorageUnit)
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+static VOID SpdIoctlRingWait(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, ULONG OutputBufferLength,
+    SPD_IOCTL_RING_WAIT_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    ULONG ProcessId = IoGetRequestorProcessId(Irp);
+
+    if (sizeof *Params > InputBufferLength ||
+        sizeof *Params > OutputBufferLength)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    Irp->IoStatus.Status = SpdStorageUnitRingWait(StorageUnit,
+        ProcessId, Params, Irp);
+    if (NT_SUCCESS(Irp->IoStatus.Status))
+        Irp->IoStatus.Information = sizeof *Params;
+
+exit:;
+    if (0 != StorageUnit)
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+static VOID SpdIoctlRingKick(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, ULONG OutputBufferLength,
+    SPD_IOCTL_RING_KICK_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit = 0;
+    ULONG ProcessId = IoGetRequestorProcessId(Irp);
+
+    if (sizeof *Params > InputBufferLength ||
+        sizeof *Params > OutputBufferLength)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        goto exit;
+    }
+
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    Irp->IoStatus.Status = SpdStorageUnitRingKick(StorageUnit,
+        ProcessId, Params);
+    if (NT_SUCCESS(Irp->IoStatus.Status))
+        Irp->IoStatus.Information = sizeof *Params;
+
+exit:;
+    if (0 != StorageUnit)
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
 VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
 {
     SPD_ENTER(ioctl,
@@ -305,6 +485,21 @@ VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
         break;
     case SPD_IOCTL_SET_TRANSACT_PID:
         SpdIoctlSetTransactProcessId(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
+        break;
+    case SPD_IOCTL_RING_OPEN:
+        SpdIoctlRingOpen(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
+        break;
+    case SPD_IOCTL_RING_CLOSE:
+        SpdIoctlRingClose(DeviceExtension, InputBufferLength, Params, Irp);
+        break;
+    case SPD_IOCTL_RING_STOP:
+        SpdIoctlRingStop(DeviceExtension, InputBufferLength, Params, Irp);
+        break;
+    case SPD_IOCTL_RING_WAIT:
+        SpdIoctlRingWait(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
+        break;
+    case SPD_IOCTL_RING_KICK:
+        SpdIoctlRingKick(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
         break;
     default:
         Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;

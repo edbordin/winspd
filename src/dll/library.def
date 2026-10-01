@@ -10,12 +10,20 @@ EXPORTS
     SpdIoctlGetList
     SpdIoctlTransact
     SpdIoctlSetTransactProcessId
+    SpdIoctlRingOpen
+    SpdIoctlRingClose
+    SpdIoctlRingWait
+    SpdIoctlRingKick
 
     ; winspd.h
     SpdStorageUnitCreate
     SpdStorageUnitDelete
     SpdStorageUnitShutdown
     SpdStorageUnitStartDispatcher
+    SpdStorageUnitProcessRequest
+    SpdStorageUnitOpenSharedRing
+    SpdStorageUnitCloseSharedRing
+    SpdStorageUnitSetSharedRingCompletionBatch
     SpdStorageUnitWaitDispatcher
     SpdStorageUnitSendResponse
     SpdStorageUnitGetOperationContext

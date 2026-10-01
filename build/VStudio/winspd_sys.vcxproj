@@ -18,6 +18,14 @@
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|ARM64">
+      <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|ARM64">
+      <Configuration>Release</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{989F4291-242B-4ABE-915F-366581E867B4}</ProjectGuid>
@@ -59,6 +67,14 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
@@ -89,6 +105,13 @@
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)build\$(ProjectName).build\$(Configuration)\$(PlatformTarget)\</IntDir>
+    <TargetName>$(MyBaseName)-$(PlatformTarget)</TargetName>
+    <EnableInf2cat>false</EnableInf2cat>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Platform)'=='ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <OutDir>$(SolutionDir)build\$(Configuration)\</OutDir>
     <IntDir>$(SolutionDir)build\$(ProjectName).build\$(Configuration)\$(PlatformTarget)\</IntDir>
@@ -155,6 +178,22 @@
       <Command>call "$(SolutionDir)..\..\tools\mkcat.bat" $(PlatformTarget) -sign "$(CertificateOutputPath)" "$(OutDir)" $(TargetName).inf $(TargetName).sys $(TargetName).dll</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='ARM64'">
+    <ClCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);NTDDI_VERSION=0x0A000008;_WIN32_WINNT=0x0A00</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>..\..\src;..\..\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>storport.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ProgramDatabaseFile>$(OutDir)$(TargetFileName).pdb</ProgramDatabaseFile>
+      <StripPrivateSymbols>$(OutDir)$(TargetFileName).public.pdb</StripPrivateSymbols>
+      <GenerateMapFile>true</GenerateMapFile>
+      <MapFileName>$(OutDir)$(TargetFileName).map</MapFileName>
+    </Link>
+    <PostBuildEvent>
+      <Command>call "$(SolutionDir)..\..\tools\mkcat.bat" arm64 "$(OutDir)" $(TargetName).inf $(TargetName).sys $(TargetName).dll</Command>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
@@ -195,6 +234,10 @@
       <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Writing $(TargetName).inf</Message>
       <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(OutDir)$(TargetName).inf</Outputs>
       <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Command Condition="'$(Platform)'=='ARM64'">call "$(SolutionDir)..\..\tools\mkinf.bat" MyProductName:"$(MyProductName)" MyDescription:"$(MyDescription)" MyCompanyName:"$(MyCompanyName)" MyCopyright:"$(MyCopyright)" MyVersion:$(MyVersion) MyBaseName:$(MyBaseName) -- %(FullPath) $(OutDir)$(TargetName).inf</Command>
+      <Message Condition="'$(Platform)'=='ARM64'">Writing $(TargetName).inf</Message>
+      <Outputs Condition="'$(Platform)'=='ARM64'">$(OutDir)$(TargetName).inf</Outputs>
+      <LinkObjects Condition="'$(Platform)'=='ARM64'">false</LinkObjects>
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
