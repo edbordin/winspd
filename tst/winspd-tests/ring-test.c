@@ -587,6 +587,10 @@ static VOID ring_test_wait_for_disk_manual(RING_TEST_STATE *State)
 
         memset(&WaitParams, 0, sizeof WaitParams);
         WaitParams.MaxRequests = 1;
+        for (UINT32 Slot = 0; State->QueueDepth > Slot; Slot++)
+            WaitParams.AvailableSlots[
+                Slot / SPD_RING_SLOT_MASK_WORD_BITS] |=
+                1ULL << (Slot % SPD_RING_SLOT_MASK_WORD_BITS);
         Error = SpdIoctlRingWait(State->StorageUnit->Handle,
             State->StorageUnit->Btl, &WaitParams);
         ASSERT(ERROR_SUCCESS == Error);
@@ -712,6 +716,7 @@ static void ioctl_ring_wait_credit_test(void)
         DWORD Error;
         memset(&WaitParams, 0, sizeof WaitParams);
         WaitParams.MaxRequests = 1;
+        WaitParams.AvailableSlots[0] = 1ULL << 3;
         Error = SpdIoctlRingWait(
             State.StorageUnit->Handle, State.StorageUnit->Btl,
             &WaitParams);

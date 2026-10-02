@@ -847,7 +847,9 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
         UINT64 Consumer;
         UINT64 Producer;
         UINT32 WaitCredits;
+        UINT32 I;
 
+        memset(&WaitParams, 0, sizeof WaitParams);
         AcquireSRWLockExclusive(&Runtime->Lock);
         while (0 == Runtime->FreeCount && !Runtime->Stop)
             SleepConditionVariableSRW(&Runtime->SpaceAvailable,
@@ -857,10 +859,19 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
             ReleaseSRWLockExclusive(&Runtime->Lock);
             break;
         }
-        WaitCredits = Runtime->FreeCount;
+        WaitCredits = 0;
+        for (I = 0; Runtime->ItemCount > I; I++)
+            if (SpdRingItemFree == Runtime->Items[I].State)
+            {
+                WaitParams.AvailableSlots[I / SPD_RING_SLOT_MASK_WORD_BITS] |=
+                    1ULL << (I % SPD_RING_SLOT_MASK_WORD_BITS);
+                WaitCredits++;
+            }
         ReleaseSRWLockExclusive(&Runtime->Lock);
 
-        memset(&WaitParams, 0, sizeof WaitParams);
+        if (0 == WaitCredits)
+            continue;
+
         WaitParams.MaxRequests = WaitCredits;
         Error = SpdStorageUnitHandleRingWait(StorageUnit->Handle,
             StorageUnit->Btl, &WaitParams);

@@ -398,6 +398,7 @@ NTSTATUS SpdStorageUnitRingWait(
     BOOLEAN First = TRUE;
     BOOLEAN ActiveSet = FALSE;
     ULONG Produced = 0;
+    ULONG AvailableCount = 0;
     UINT64 Producer = 0;
     UINT64 Consumer = 0;
     NTSTATUS Result = STATUS_SUCCESS;
@@ -406,6 +407,19 @@ NTSTATUS SpdStorageUnitRingWait(
         return STATUS_ACCESS_DENIED;
     if (0 == Params->MaxRequests ||
         Params->MaxRequests > StorageUnit->RingQueueDepth)
+        return STATUS_INVALID_PARAMETER;
+    for (ULONG I = 0; StorageUnit->RingQueueDepth > I; I++)
+        if (0 != (Params->AvailableSlots[
+            I / SPD_RING_SLOT_MASK_WORD_BITS] &
+            (1ULL << (I % SPD_RING_SLOT_MASK_WORD_BITS))))
+            AvailableCount++;
+    for (ULONG I = StorageUnit->RingQueueDepth;
+        SPD_RING_MAX_QUEUE_DEPTH > I; I++)
+        if (0 != (Params->AvailableSlots[
+            I / SPD_RING_SLOT_MASK_WORD_BITS] &
+            (1ULL << (I % SPD_RING_SLOT_MASK_WORD_BITS))))
+            return STATUS_INVALID_PARAMETER;
+    if (Params->MaxRequests > AvailableCount)
         return STATUS_INVALID_PARAMETER;
     if (!SpdStorageUnitRingEnter(StorageUnit))
         return STATUS_INVALID_DEVICE_STATE;
@@ -436,7 +450,10 @@ NTSTATUS SpdStorageUnitRingWait(
                  * next WAIT, after userspace has reclaimed their items. */
                 for (UINT32 I = 0; StorageUnit->RingQueueDepth > I; I++)
                     StorageUnit->RingPending[I].WaitAvailable =
-                        !StorageUnit->RingPending[I].InUse;
+                        !StorageUnit->RingPending[I].InUse &&
+                        0 != (Params->AvailableSlots[
+                            I / SPD_RING_SLOT_MASK_WORD_BITS] &
+                            (1ULL << (I % SPD_RING_SLOT_MASK_WORD_BITS)));
                 ActiveSet = TRUE;
             }
         }
