@@ -364,6 +364,7 @@ typedef struct
     UINT32 DataLength;
     UINT8 Kind;
     BOOLEAN InUse;
+    BOOLEAN WaitAvailable;
 } SPD_RING_PENDING;
 
 /* storage units */

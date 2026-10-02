@@ -358,9 +358,11 @@ static BOOLEAN SpdStorageUnitRingAllocateBuffer(
     SPD_STORAGE_UNIT *StorageUnit, PUINT32 PSlot)
 {
     for (UINT32 I = 0; StorageUnit->RingQueueDepth > I; I++)
-        if (!StorageUnit->RingPending[I].InUse)
+        if (StorageUnit->RingPending[I].WaitAvailable &&
+            !StorageUnit->RingPending[I].InUse)
         {
             StorageUnit->RingPending[I].InUse = TRUE;
+            StorageUnit->RingPending[I].WaitAvailable = FALSE;
             *PSlot = I;
             return TRUE;
         }
@@ -429,6 +431,12 @@ NTSTATUS SpdStorageUnitRingWait(
             else
             {
                 StorageUnit->RingWaitActive = TRUE;
+                /* A concurrent KICK may free slots while this WAIT is
+                 * blocked for work. Keep those slots unavailable until the
+                 * next WAIT, after userspace has reclaimed their items. */
+                for (UINT32 I = 0; StorageUnit->RingQueueDepth > I; I++)
+                    StorageUnit->RingPending[I].WaitAvailable =
+                        !StorageUnit->RingPending[I].InUse;
                 ActiveSet = TRUE;
             }
         }
@@ -583,6 +591,8 @@ NTSTATUS SpdStorageUnitRingWait(
         KeAcquireSpinLock(&StorageUnit->RingLock, &Irql);
         if (0 != Produced)
             SpdRingStoreCounter(&Header->SubmissionProducer, Producer);
+        for (UINT32 I = 0; StorageUnit->RingQueueDepth > I; I++)
+            StorageUnit->RingPending[I].WaitAvailable = FALSE;
         StorageUnit->RingWaitActive = FALSE;
         KeReleaseSpinLock(&StorageUnit->RingLock, Irql);
     }
