@@ -361,10 +361,10 @@ typedef struct
 {
     PVOID SrbExtension;
     UINT64 Token;
-    UINT32 BufferSlot;
     UINT32 DataLength;
     UINT8 Kind;
     BOOLEAN InUse;
+    BOOLEAN WaitAvailable;
 } SPD_RING_PENDING;
 
 /* storage units */
@@ -400,15 +400,12 @@ typedef struct _SPD_STORAGE_UNIT
     BOOLEAN RingWaitActive;
     BOOLEAN RingClosing;
     BOOLEAN RingFailed;
-    UINT32 RingGeneration;
+    UINT32 RingRequestSequence;
+    UINT32 RingQueueDepth;
     UINT32 RingSubmissionOffset;
-    UINT32 RingSubmissionCount;
     UINT32 RingCompletionOffset;
-    UINT32 RingCompletionCount;
     UINT32 RingBufferOffset;
-    UINT32 RingBufferCount;
     UINT32 RingBufferSize;
-    UINT32 RingPendingCount;
     SPD_RING_PENDING *RingPending;
 } SPD_STORAGE_UNIT;
 NTSTATUS SpdDeviceExtensionInit(SPD_DEVICE_EXTENSION *DeviceExtension, PVOID BusInformation);

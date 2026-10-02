@@ -84,8 +84,6 @@ typedef struct _SPD_STORAGE_UNIT
     PVOID SharedRingAddress;
     SIZE_T SharedRingSize;
     SPD_RING_HEADER *SharedRingHeader;
-    UINT32 SharedRingCompletionBatchSize;
-    UINT32 SharedRingCompletionWaitMicroseconds;
     SRWLOCK SharedRingRuntimeLock;
     PVOID SharedRingRuntime;
 } SPD_STORAGE_UNIT;
@@ -160,10 +158,6 @@ BOOLEAN SpdStorageUnitProcessRequest(SPD_STORAGE_UNIT *StorageUnit,
  */
 DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
     SPD_IOCTL_RING_OPEN_PARAMS *Params);
-/** Configure the maximum completion batch and optional coalescing timeout. */
-DWORD SpdStorageUnitSetSharedRingCompletionBatch(
-    SPD_STORAGE_UNIT *StorageUnit, UINT32 MaxBatchSize,
-    UINT32 MaxWaitMicroseconds);
 /** Close and unmap the SharedRingV1 mapping, if enabled. */
 VOID SpdStorageUnitCloseSharedRing(SPD_STORAGE_UNIT *StorageUnit);
 /**

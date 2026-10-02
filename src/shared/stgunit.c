@@ -19,6 +19,7 @@
  * associated repository.
  */
 
+#include <assert.h>
 #include <shared/shared.h>
 
 DWORD SpdStorageUnitHandleOpen(PWSTR Name,
@@ -48,6 +49,14 @@ static SRWLOCK SpdStorageUnitTlsLock = SRWLOCK_INIT;
 static DWORD SpdStorageUnitTlsKey = TLS_OUT_OF_INDEXES;
 
 typedef struct _SPD_RING_RUNTIME SPD_RING_RUNTIME;
+typedef enum
+{
+    SpdRingItemFree,
+    SpdRingItemWorkQueued,
+    SpdRingItemProcessing,
+    SpdRingItemDeferred,
+    SpdRingItemDoneQueued
+} SPD_RING_ITEM_STATE;
 typedef struct _SPD_RING_WORK_ITEM
 {
     LIST_ENTRY Link;
@@ -55,12 +64,9 @@ typedef struct _SPD_RING_WORK_ITEM
     SPD_IOCTL_TRANSACT_RSP Response;
     SPD_IOCTL_TRANSACT_RSP EarlyResponse;
     PVOID DataBuffer;
-    UINT32 Slot;
     UINT32 DataLength;
-    BOOLEAN InUse;
-    BOOLEAN Processing;
-    BOOLEAN Deferred;
-    BOOLEAN EarlyResponseReady;
+    SPD_RING_ITEM_STATE State;
+    BOOLEAN ResponseArrivedWhileProcessing;
 } SPD_RING_WORK_ITEM;
 struct _SPD_RING_RUNTIME
 {
@@ -69,19 +75,15 @@ struct _SPD_RING_RUNTIME
     CONDITION_VARIABLE WorkAvailable;
     CONDITION_VARIABLE SpaceAvailable;
     CONDITION_VARIABLE DoneAvailable;
-    LIST_ENTRY Free;
     LIST_ENTRY Work;
     LIST_ENTRY Done;
     SPD_RING_WORK_ITEM *Items;
     UINT32 ItemCount;
-    UINT32 RequestsInFlight;
+    UINT32 FreeCount;
+    UINT32 WorkersRunning;
     HANDLE *WorkerThreads;
     ULONG WorkerCount;
-    UINT32 CompletionBatchSize;
-    UINT32 CompletionWaitMicroseconds;
     HANDLE CompletionThread;
-    HANDLE DoneEvent;
-    HANDLE BatchTimer;
     volatile LONG References;
     BOOLEAN Stop;
     BOOLEAN ShutdownRequested;
@@ -230,22 +232,6 @@ DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
     StorageUnit->SharedRingSize = (SIZE_T)Params->SectionSize;
     StorageUnit->SharedRingHeader =
         (SPD_RING_HEADER *)StorageUnit->SharedRingAddress;
-    return ERROR_SUCCESS;
-}
-
-DWORD SpdStorageUnitSetSharedRingCompletionBatch(
-    SPD_STORAGE_UNIT *StorageUnit, UINT32 MaxBatchSize,
-    UINT32 MaxWaitMicroseconds)
-{
-    if (0 == StorageUnit || 0 == StorageUnit->SharedRingHeader)
-        return ERROR_INVALID_PARAMETER;
-    if (0 != StorageUnit->SharedRingRuntime)
-        return ERROR_INVALID_STATE;
-    if (MaxBatchSize > StorageUnit->SharedRingHeader->CompletionCount ||
-        1000000 < MaxWaitMicroseconds)
-        return ERROR_INVALID_PARAMETER;
-    StorageUnit->SharedRingCompletionBatchSize = MaxBatchSize;
-    StorageUnit->SharedRingCompletionWaitMicroseconds = MaxWaitMicroseconds;
     return ERROR_SUCCESS;
 }
 
@@ -466,10 +452,7 @@ static VOID SpdRingRuntimeSetError(SPD_RING_RUNTIME *Runtime, DWORD Error)
     WakeAllConditionVariable(&Runtime->SpaceAvailable);
     WakeAllConditionVariable(&Runtime->DoneAvailable);
     ReleaseSRWLockExclusive(&Runtime->Lock);
-    if (0 != Runtime->DoneEvent)
-        SetEvent(Runtime->DoneEvent);
-
-    /* Interrupt a reader blocked in the batch WAIT doorbell. */
+    /* Interrupt a reader blocked in RingWait. */
     CancelIoEx(Runtime->StorageUnit->Handle, 0);
 }
 
@@ -481,9 +464,6 @@ static VOID SpdRingRuntimeStop(SPD_RING_RUNTIME *Runtime)
     WakeAllConditionVariable(&Runtime->SpaceAvailable);
     WakeAllConditionVariable(&Runtime->DoneAvailable);
     ReleaseSRWLockExclusive(&Runtime->Lock);
-    if (0 != Runtime->DoneEvent)
-        SetEvent(Runtime->DoneEvent);
-
     /* Interrupt outstanding asynchronous calls during error teardown. */
     CancelIoEx(Runtime->StorageUnit->Handle, 0);
 }
@@ -497,9 +477,6 @@ static VOID SpdRingRuntimeRequestShutdown(SPD_RING_RUNTIME *Runtime)
     WakeAllConditionVariable(&Runtime->SpaceAvailable);
     WakeAllConditionVariable(&Runtime->DoneAvailable);
     ReleaseSRWLockExclusive(&Runtime->Lock);
-    if (0 != Runtime->DoneEvent)
-        SetEvent(Runtime->DoneEvent);
-
     /* Reset outstanding SRBs to release the synchronous kernel WAIT, while
      * leaving the shared mapping alive until dispatcher threads have joined. */
     DWORD Error = SpdStorageUnitHandleRingStop(
@@ -534,9 +511,9 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         Item = CONTAINING_RECORD(Runtime->Work.Flink,
             SPD_RING_WORK_ITEM, Link);
         SpdRingListRemove(&Item->Link);
-        Item->Processing = TRUE;
-        Item->Deferred = FALSE;
-        Item->EarlyResponseReady = FALSE;
+        assert(SpdRingItemWorkQueued == Item->State);
+        Item->State = SpdRingItemProcessing;
+        Item->ResponseArrivedWhileProcessing = FALSE;
         ReleaseSRWLockExclusive(&Runtime->Lock);
 
         if (StorageUnit->DebugLog)
@@ -555,30 +532,31 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         TlsSetValue(SpdStorageUnitTlsKey, 0);
 
         AcquireSRWLockExclusive(&Runtime->Lock);
-        Item->Processing = FALSE;
         if (Complete)
         {
-            Runtime->RequestsInFlight--;
+            Item->State = SpdRingItemDoneQueued;
             SpdRingListInsertTail(&Runtime->Done, &Item->Link);
             WakeConditionVariable(&Runtime->DoneAvailable);
-            if (0 != Runtime->DoneEvent)
-                SetEvent(Runtime->DoneEvent);
         }
-        else if (Item->EarlyResponseReady)
+        else if (Item->ResponseArrivedWhileProcessing)
         {
-            Runtime->RequestsInFlight--;
             memcpy(&Item->Response, &Item->EarlyResponse,
                 sizeof Item->Response);
-            Item->EarlyResponseReady = FALSE;
+            Item->ResponseArrivedWhileProcessing = FALSE;
+            Item->State = SpdRingItemDoneQueued;
             SpdRingListInsertTail(&Runtime->Done, &Item->Link);
             WakeConditionVariable(&Runtime->DoneAvailable);
-            if (0 != Runtime->DoneEvent)
-                SetEvent(Runtime->DoneEvent);
         }
         else
-            Item->Deferred = TRUE;
+            Item->State = SpdRingItemDeferred;
         ReleaseSRWLockExclusive(&Runtime->Lock);
     }
+
+    AcquireSRWLockExclusive(&Runtime->Lock);
+    assert(0 != Runtime->WorkersRunning);
+    Runtime->WorkersRunning--;
+    WakeAllConditionVariable(&Runtime->DoneAvailable);
+    ReleaseSRWLockExclusive(&Runtime->Lock);
 
     return ERROR_SUCCESS;
 }
@@ -593,72 +571,23 @@ static DWORD WINAPI SpdStorageUnitRingCompletionThread(PVOID Runtime0)
     {
         LIST_ENTRY LocalDone;
         UINT32 BatchCount = 0;
-        UINT32 PendingCount;
         UINT64 Producer;
         UINT64 Consumer;
         DWORD Error = ERROR_SUCCESS;
 
         SpdRingListInitialize(&LocalDone);
         AcquireSRWLockExclusive(&Runtime->Lock);
-        while (SpdRingListEmpty(&Runtime->Done) && !Runtime->Stop)
+        while (SpdRingListEmpty(&Runtime->Done) &&
+            (!Runtime->Stop || 0 != Runtime->WorkersRunning))
             SleepConditionVariableSRW(&Runtime->DoneAvailable,
                 &Runtime->Lock, INFINITE, 0);
-        if (SpdRingListEmpty(&Runtime->Done) && Runtime->Stop)
+        if (SpdRingListEmpty(&Runtime->Done) && Runtime->Stop &&
+            0 == Runtime->WorkersRunning)
         {
             ReleaseSRWLockExclusive(&Runtime->Lock);
             break;
         }
-        if (0 != Runtime->CompletionWaitMicroseconds &&
-            1 < Runtime->CompletionBatchSize)
-        {
-            PendingCount = 0;
-            for (PLIST_ENTRY Entry = Runtime->Done.Flink;
-                Entry != &Runtime->Done; Entry = Entry->Flink)
-                PendingCount++;
-            if (PendingCount < Runtime->CompletionBatchSize &&
-                0 != Runtime->RequestsInFlight &&
-                !Runtime->Stop)
-            {
-                LARGE_INTEGER DueTime;
-                HANDLE WaitObjects[2];
-                DWORD WaitResult;
-
-                /* Reset while holding Lock, so producers cannot enqueue and
-                 * signal between the empty-count check and the reset. */
-                ResetEvent(Runtime->DoneEvent);
-                DueTime.QuadPart = -((LONGLONG)
-                    Runtime->CompletionWaitMicroseconds * 10);
-                if (!SetWaitableTimer(Runtime->BatchTimer, &DueTime,
-                    0, 0, 0, FALSE))
-                    Error = GetLastError();
-                else
-                {
-                    WaitObjects[0] = Runtime->DoneEvent;
-                    WaitObjects[1] = Runtime->BatchTimer;
-                    ReleaseSRWLockExclusive(&Runtime->Lock);
-                    WaitResult = WaitForMultipleObjects(2, WaitObjects,
-                        FALSE, INFINITE);
-                    CancelWaitableTimer(Runtime->BatchTimer);
-                    AcquireSRWLockExclusive(&Runtime->Lock);
-                    if (WAIT_OBJECT_0 != WaitResult &&
-                        WAIT_OBJECT_0 + 1 != WaitResult)
-                        Error = GetLastError();
-                }
-            }
-        }
-        if (ERROR_SUCCESS != Error)
-        {
-            ReleaseSRWLockExclusive(&Runtime->Lock);
-            SpdRingRuntimeSetError(Runtime, Error);
-            break;
-        }
-        if (SpdRingListEmpty(&Runtime->Done) && Runtime->Stop)
-        {
-            ReleaseSRWLockExclusive(&Runtime->Lock);
-            break;
-        }
-        while (!SpdRingListEmpty(&Runtime->Done) &&
-            BatchCount < Runtime->CompletionBatchSize)
+        while (!SpdRingListEmpty(&Runtime->Done))
         {
             PLIST_ENTRY Entry = SpdRingListRemoveHead(&Runtime->Done);
             SpdRingListInsertTail(&LocalDone, Entry);
@@ -669,54 +598,49 @@ static DWORD WINAPI SpdStorageUnitRingCompletionThread(PVOID Runtime0)
         Producer = SpdRingLoadCounter(&Header->CompletionProducer);
         Consumer = SpdRingLoadCounter(&Header->CompletionConsumer);
         if (Consumer > Producer ||
-            Producer - Consumer > Header->CompletionCount)
+            Producer - Consumer > Header->QueueDepth ||
+            BatchCount > Header->QueueDepth - (Producer - Consumer))
         {
-            SpdDebugLog("SharedRing completion counters invalid producer=%I64u consumer=%I64u count=%lu\n",
-                Producer, Consumer, (unsigned long)Header->CompletionCount);
+            SpdDebugLog("SharedRing completion counters invalid producer=%I64u consumer=%I64u depth=%lu batch=%lu\n",
+                Producer, Consumer, (unsigned long)Header->QueueDepth,
+                (unsigned long)BatchCount);
             Error = ERROR_INVALID_DATA;
         }
 
-        while (ERROR_SUCCESS == Error && !SpdRingListEmpty(&LocalDone))
+        UINT32 Index = 0;
+        for (PLIST_ENTRY Entry = LocalDone.Flink;
+            ERROR_SUCCESS == Error && Entry != &LocalDone;
+            Entry = Entry->Flink, Index++)
         {
             SPD_RING_WORK_ITEM *Item = CONTAINING_RECORD(
-                LocalDone.Flink, SPD_RING_WORK_ITEM, Link);
+                Entry, SPD_RING_WORK_ITEM, Link);
             SPD_RING_COMPLETION *Completion;
 
-            if (Producer - Consumer >= Header->CompletionCount)
-            {
-                SpdDebugLog("SharedRing completion ring full producer=%I64u consumer=%I64u count=%lu\n",
-                    Producer, Consumer, (unsigned long)Header->CompletionCount);
-                Error = ERROR_NOT_ENOUGH_MEMORY;
-                break;
-            }
-
-            SpdRingListRemove(&Item->Link);
+            assert(SpdRingItemDoneQueued == Item->State);
             Completion = (SPD_RING_COMPLETION *)
                 ((PUINT8)StorageUnit->SharedRingAddress +
                 Header->CompletionOffset +
-                (Producer % Header->CompletionCount) * sizeof *Completion);
+                ((Producer + Index) % Header->QueueDepth) *
+                    sizeof *Completion);
             memcpy(&Completion->Response, &Item->Response,
                 sizeof Completion->Response);
-            MemoryBarrier();
-            SpdRingStoreCounter(&Header->CompletionProducer, ++Producer);
-
-            AcquireSRWLockExclusive(&Runtime->Lock);
-            Item->InUse = FALSE;
-            SpdRingListInsertTail(&Runtime->Free, &Item->Link);
-            Item->Deferred = FALSE;
-            ReleaseSRWLockExclusive(&Runtime->Lock);
         }
 
         if (ERROR_SUCCESS == Error)
         {
             SPD_IOCTL_RING_KICK_PARAMS KickParams;
             memset(&KickParams, 0, sizeof KickParams);
+            SpdRingStoreCounter(&Header->CompletionProducer,
+                Producer + BatchCount);
             Error = SpdStorageUnitHandleRingKick(StorageUnit->Handle,
                 StorageUnit->Btl, &KickParams);
             Runtime->CompletionBatches++;
             Runtime->CompletedRequests += KickParams.Consumed;
             if (BatchCount > Runtime->MaxCompletionBatch)
                 Runtime->MaxCompletionBatch = BatchCount;
+            if (ERROR_SUCCESS == Error &&
+                BatchCount != KickParams.Consumed)
+                Error = ERROR_INVALID_DATA;
             if (ERROR_SUCCESS != Error)
                 SpdDebugLog("SharedRing completion kick failed error=%lu consumed=%lu\n",
                     (unsigned long)Error, (unsigned long)KickParams.Consumed);
@@ -724,21 +648,23 @@ static DWORD WINAPI SpdStorageUnitRingCompletionThread(PVOID Runtime0)
 
         if (ERROR_SUCCESS != Error)
         {
-            while (!SpdRingListEmpty(&LocalDone))
-            {
-                SPD_RING_WORK_ITEM *Item = CONTAINING_RECORD(
-                    LocalDone.Flink, SPD_RING_WORK_ITEM, Link);
-                SpdRingListRemove(&Item->Link);
-                AcquireSRWLockExclusive(&Runtime->Lock);
-                Item->InUse = FALSE;
-                SpdRingListInsertTail(&Runtime->Free, &Item->Link);
-                ReleaseSRWLockExclusive(&Runtime->Lock);
-            }
             SpdRingRuntimeSetError(Runtime, Error);
             break;
         }
 
         AcquireSRWLockExclusive(&Runtime->Lock);
+        while (!SpdRingListEmpty(&LocalDone))
+        {
+            SPD_RING_WORK_ITEM *Item = CONTAINING_RECORD(
+                SpdRingListRemoveHead(&LocalDone),
+                SPD_RING_WORK_ITEM, Link);
+            assert(SpdRingItemDoneQueued == Item->State);
+            Item->State = SpdRingItemFree;
+            Item->DataBuffer = 0;
+            Item->DataLength = 0;
+            Runtime->FreeCount++;
+        }
+        assert(Runtime->FreeCount <= Runtime->ItemCount);
         WakeAllConditionVariable(&Runtime->SpaceAvailable);
         ReleaseSRWLockExclusive(&Runtime->Lock);
     }
@@ -754,10 +680,12 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     DWORD Error = ERROR_SUCCESS;
 
     if (0 != StorageUnit->SharedRingRuntime ||
-        Header->BufferCount > Header->CompletionCount)
+        0 == Header->QueueDepth || 4096 < Header->QueueDepth)
         return ERROR_INVALID_PARAMETER;
     if (0 == WorkerCount)
         WorkerCount = 1;
+    if (WorkerCount > Header->QueueDepth)
+        WorkerCount = Header->QueueDepth;
     if (1024 < WorkerCount)
         WorkerCount = 1024;
 
@@ -767,37 +695,15 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     memset(Runtime, 0, sizeof *Runtime);
     Runtime->StorageUnit = StorageUnit;
     Runtime->WorkerCount = WorkerCount;
-    Runtime->ItemCount = Header->BufferCount;
-    Runtime->CompletionBatchSize =
-        0 != StorageUnit->SharedRingCompletionBatchSize ?
-        StorageUnit->SharedRingCompletionBatchSize : Header->CompletionCount;
-    Runtime->CompletionWaitMicroseconds =
-        StorageUnit->SharedRingCompletionWaitMicroseconds;
+    Runtime->ItemCount = Header->QueueDepth;
+    Runtime->FreeCount = Runtime->ItemCount;
     Runtime->References = 1; /* owner reference held by StorageUnit */
     InitializeSRWLock(&Runtime->Lock);
     InitializeConditionVariable(&Runtime->WorkAvailable);
     InitializeConditionVariable(&Runtime->SpaceAvailable);
     InitializeConditionVariable(&Runtime->DoneAvailable);
-    SpdRingListInitialize(&Runtime->Free);
     SpdRingListInitialize(&Runtime->Work);
     SpdRingListInitialize(&Runtime->Done);
-
-    if (0 != Runtime->CompletionWaitMicroseconds)
-    {
-        Runtime->DoneEvent = CreateEventW(0, TRUE, FALSE, 0);
-        if (0 == Runtime->DoneEvent)
-        {
-            Error = GetLastError();
-            goto exit;
-        }
-        Runtime->BatchTimer = CreateWaitableTimerExW(0, 0,
-            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (0 == Runtime->BatchTimer)
-        {
-            Error = GetLastError();
-            goto exit;
-        }
-    }
 
     Runtime->Items = MemAlloc(sizeof *Runtime->Items * Runtime->ItemCount);
     Runtime->WorkerThreads = MemAlloc(
@@ -812,11 +718,8 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     memset(Runtime->WorkerThreads, 0,
         sizeof *Runtime->WorkerThreads * Runtime->WorkerCount);
     for (UINT32 I = 0; Runtime->ItemCount > I; I++)
-        SpdRingListInsertTail(&Runtime->Free, &Runtime->Items[I].Link);
+        SpdRingListInitialize(&Runtime->Items[I].Link);
 
-    AcquireSRWLockExclusive(&StorageUnit->SharedRingRuntimeLock);
-    StorageUnit->SharedRingRuntime = Runtime;
-    ReleaseSRWLockExclusive(&StorageUnit->SharedRingRuntimeLock);
     Runtime->CompletionThread = CreateThread(0, 0,
         SpdStorageUnitRingCompletionThread, Runtime, 0, 0);
     if (0 == Runtime->CompletionThread)
@@ -826,14 +729,24 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     }
     for (ULONG I = 0; Runtime->WorkerCount > I; I++)
     {
+        AcquireSRWLockExclusive(&Runtime->Lock);
+        Runtime->WorkersRunning++;
+        ReleaseSRWLockExclusive(&Runtime->Lock);
         Runtime->WorkerThreads[I] = CreateThread(0, 0,
             SpdStorageUnitRingWorkerThread, Runtime, 0, 0);
         if (0 == Runtime->WorkerThreads[I])
         {
+            AcquireSRWLockExclusive(&Runtime->Lock);
+            Runtime->WorkersRunning--;
+            WakeAllConditionVariable(&Runtime->DoneAvailable);
+            ReleaseSRWLockExclusive(&Runtime->Lock);
             Error = GetLastError();
             goto exit;
         }
     }
+    AcquireSRWLockExclusive(&StorageUnit->SharedRingRuntimeLock);
+    StorageUnit->SharedRingRuntime = Runtime;
+    ReleaseSRWLockExclusive(&StorageUnit->SharedRingRuntimeLock);
     return ERROR_SUCCESS;
 
 exit:
@@ -846,10 +759,6 @@ exit:
                 WaitForSingleObject(Runtime->WorkerThreads[I], INFINITE);
     if (0 != Runtime->CompletionThread)
         CloseHandle(Runtime->CompletionThread);
-    if (0 != Runtime->DoneEvent)
-        CloseHandle(Runtime->DoneEvent);
-    if (0 != Runtime->BatchTimer)
-        CloseHandle(Runtime->BatchTimer);
     if (0 != Runtime->WorkerThreads)
         for (ULONG I = 0; Runtime->WorkerCount > I; I++)
             if (0 != Runtime->WorkerThreads[I])
@@ -897,24 +806,17 @@ static DWORD SpdStorageUnitRingRuntimeDestroy(SPD_STORAGE_UNIT *StorageUnit)
     WaitForSingleObject(Runtime->CompletionThread, INFINITE);
     SpdDebugLog("SharedRing batches submissions=%I64u requests=%I64u "
         "max=%lu completions=%I64u responses=%I64u max=%lu workers=%lu "
-        "slots=%lu sq=%lu cq=%lu cbatch=%lu cwait_us=%lu\n",
+        "depth=%lu buffer_size=%lu\n",
         Runtime->SubmissionBatches, Runtime->SubmittedRequests,
         (unsigned long)Runtime->MaxSubmissionBatch,
         Runtime->CompletionBatches, Runtime->CompletedRequests,
         (unsigned long)Runtime->MaxCompletionBatch,
         (unsigned long)Runtime->WorkerCount,
         (unsigned long)Runtime->ItemCount,
-        (unsigned long)StorageUnit->SharedRingHeader->SubmissionCount,
-        (unsigned long)StorageUnit->SharedRingHeader->CompletionCount,
-        (unsigned long)Runtime->CompletionBatchSize,
-        (unsigned long)Runtime->CompletionWaitMicroseconds);
+        (unsigned long)StorageUnit->SharedRingHeader->BufferSize);
     for (ULONG I = 0; Runtime->WorkerCount > I; I++)
         CloseHandle(Runtime->WorkerThreads[I]);
     CloseHandle(Runtime->CompletionThread);
-    if (0 != Runtime->DoneEvent)
-        CloseHandle(Runtime->DoneEvent);
-    if (0 != Runtime->BatchTimer)
-        CloseHandle(Runtime->BatchTimer);
     DWORD Error = Runtime->Error;
     SpdStorageUnitRingRuntimeRelease(Runtime);
     for (;;)
@@ -944,10 +846,12 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
         SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
         UINT64 Consumer;
         UINT64 Producer;
-        ULONG FreeCount = 0;
+        UINT32 WaitCredits;
+        UINT32 I;
 
+        memset(&WaitParams, 0, sizeof WaitParams);
         AcquireSRWLockExclusive(&Runtime->Lock);
-        while (SpdRingListEmpty(&Runtime->Free) && !Runtime->Stop)
+        while (0 == Runtime->FreeCount && !Runtime->Stop)
             SleepConditionVariableSRW(&Runtime->SpaceAvailable,
                 &Runtime->Lock, INFINITE, 0);
         if (Runtime->Stop)
@@ -955,20 +859,26 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
             ReleaseSRWLockExclusive(&Runtime->Lock);
             break;
         }
-        for (PLIST_ENTRY Entry = Runtime->Free.Flink;
-            Entry != &Runtime->Free; Entry = Entry->Flink)
-            FreeCount++;
+        WaitCredits = 0;
+        for (I = 0; Runtime->ItemCount > I; I++)
+            if (SpdRingItemFree == Runtime->Items[I].State)
+            {
+                WaitParams.AvailableSlots[I / SPD_RING_SLOT_MASK_WORD_BITS] |=
+                    1ULL << (I % SPD_RING_SLOT_MASK_WORD_BITS);
+                WaitCredits++;
+            }
         ReleaseSRWLockExclusive(&Runtime->Lock);
 
-        memset(&WaitParams, 0, sizeof WaitParams);
-        WaitParams.MaxRequests = FreeCount < Header->SubmissionCount ?
-            FreeCount : Header->SubmissionCount;
+        if (0 == WaitCredits)
+            continue;
+
+        WaitParams.MaxRequests = WaitCredits;
         Error = SpdStorageUnitHandleRingWait(StorageUnit->Handle,
             StorageUnit->Btl, &WaitParams);
         if (ERROR_SUCCESS != Error)
         {
-            SpdDebugLog("SharedRing dispatcher wait failed error=%lu max=%lu\n",
-                (unsigned long)Error, (unsigned long)WaitParams.MaxRequests);
+            SpdDebugLog("SharedRing dispatcher wait failed error=%lu\n",
+                (unsigned long)Error);
             break;
         }
         Runtime->SubmissionBatches++;
@@ -979,10 +889,10 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
         Consumer = SpdRingLoadCounter(&Header->SubmissionConsumer);
         Producer = SpdRingLoadCounter(&Header->SubmissionProducer);
         if (Consumer > Producer ||
-            Producer - Consumer > Header->SubmissionCount)
+            Producer - Consumer > Header->QueueDepth)
         {
-            SpdDebugLog("SharedRing submission counters invalid producer=%I64u consumer=%I64u count=%lu\n",
-                Producer, Consumer, (unsigned long)Header->SubmissionCount);
+            SpdDebugLog("SharedRing submission counters invalid producer=%I64u consumer=%I64u depth=%lu\n",
+                Producer, Consumer, (unsigned long)Header->QueueDepth);
             Error = ERROR_INVALID_DATA;
             break;
         }
@@ -992,7 +902,7 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
             SPD_RING_REQUEST *RingRequest = (SPD_RING_REQUEST *)
                 ((PUINT8)StorageUnit->SharedRingAddress +
                 Header->SubmissionOffset +
-                (Consumer % Header->SubmissionCount) * sizeof *RingRequest);
+                (Consumer % Header->QueueDepth) * sizeof *RingRequest);
             SPD_RING_BUFFER_REF Data = RingRequest->Data;
             SPD_RING_WORK_ITEM *Item;
             UINT32 ItemIndex = (UINT32)RingRequest->Request.Hint;
@@ -1045,17 +955,19 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
                     (unsigned long)Runtime->ItemCount);
                 Error = ERROR_INVALID_DATA;
             }
+            if (ERROR_SUCCESS != Error)
+                break;
 
             if (ERROR_SUCCESS == Error && Data.Slot != SPD_RING_NO_BUFFER)
             {
-                if (Data.Slot >= Header->BufferCount ||
+                if (Data.Slot >= Header->QueueDepth ||
                     Data.Offset > Header->BufferSize ||
                     Data.Length > Header->BufferSize - Data.Offset)
                 {
-                    SpdDebugLog("SharedRing request buffer invalid slot=%lu offset=%lu length=%lu buffer_count=%lu buffer_size=%lu\n",
+                    SpdDebugLog("SharedRing request buffer invalid slot=%lu offset=%lu length=%lu depth=%lu buffer_size=%lu\n",
                         (unsigned long)Data.Slot, (unsigned long)Data.Offset,
                         (unsigned long)Data.Length,
-                        (unsigned long)Header->BufferCount,
+                        (unsigned long)Header->QueueDepth,
                         (unsigned long)Header->BufferSize);
                     Error = ERROR_INVALID_DATA;
                     break;
@@ -1075,7 +987,8 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
             }
             AcquireSRWLockExclusive(&Runtime->Lock);
             Item = &Runtime->Items[ItemIndex];
-            if (Item->InUse)
+            if (SpdRingItemFree != Item->State ||
+                0 == Runtime->FreeCount)
             {
                 SpdDebugLog("SharedRing request token slot already in use hint=%I64u slot=%lu\n",
                     RingRequest->Request.Hint, (unsigned long)ItemIndex);
@@ -1083,25 +996,24 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
                 Error = ERROR_INVALID_DATA;
                 break;
             }
-            SpdRingListRemove(&Item->Link);
-            Item->InUse = TRUE;
+            Item->State = SpdRingItemWorkQueued;
+            Runtime->FreeCount--;
             ReleaseSRWLockExclusive(&Runtime->Lock);
 
             memcpy(&Item->Request, &RingRequest->Request,
                 sizeof Item->Request);
             Item->DataBuffer = DataBuffer;
             Item->DataLength = Data.Length;
-            Item->Slot = Data.Slot;
-            Item->Deferred = FALSE;
             Consumer++;
-            SpdRingStoreCounter(&Header->SubmissionConsumer, Consumer);
 
             AcquireSRWLockExclusive(&Runtime->Lock);
-            Runtime->RequestsInFlight++;
             SpdRingListInsertTail(&Runtime->Work, &Item->Link);
             WakeConditionVariable(&Runtime->WorkAvailable);
             ReleaseSRWLockExclusive(&Runtime->Lock);
         }
+
+        if (ERROR_SUCCESS == Error)
+            SpdRingStoreCounter(&Header->SubmissionConsumer, Consumer);
 
         if (ERROR_SUCCESS != Error)
             break;
@@ -1227,7 +1139,8 @@ VOID SpdStorageUnitSendResponse(SPD_STORAGE_UNIT *StorageUnit,
         if (ItemIndex < Runtime->ItemCount)
         {
             SPD_RING_WORK_ITEM *Item = &Runtime->Items[ItemIndex];
-            if (Item->InUse && (Item->Processing || Item->Deferred) &&
+            if ((SpdRingItemProcessing == Item->State ||
+                SpdRingItemDeferred == Item->State) &&
                 Item->Request.Hint == Response->Hint &&
                 Item->Request.Kind == Response->Kind)
                 Found = Item;
@@ -1237,22 +1150,19 @@ VOID SpdStorageUnitSendResponse(SPD_STORAGE_UNIT *StorageUnit,
             if (0 != DataBuffer && 0 != Found->DataBuffer &&
                 DataBuffer != Found->DataBuffer && 0 != Found->DataLength)
                 memcpy(Found->DataBuffer, DataBuffer, Found->DataLength);
-            if (Found->Processing)
+            if (SpdRingItemProcessing == Found->State)
             {
                 memcpy(&Found->EarlyResponse, Response,
                     sizeof Found->EarlyResponse);
-                Found->EarlyResponseReady = TRUE;
+                Found->ResponseArrivedWhileProcessing = TRUE;
             }
             else
             {
                 memcpy(&Found->Response, Response,
                     sizeof Found->Response);
-                Found->Deferred = FALSE;
-                Runtime->RequestsInFlight--;
+                Found->State = SpdRingItemDoneQueued;
                 SpdRingListInsertTail(&Runtime->Done, &Found->Link);
                 WakeConditionVariable(&Runtime->DoneAvailable);
-                if (0 != Runtime->DoneEvent)
-                    SetEvent(Runtime->DoneEvent);
             }
         }
         ReleaseSRWLockExclusive(&Runtime->Lock);

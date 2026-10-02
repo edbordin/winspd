@@ -206,6 +206,10 @@ typedef struct
 /* SharedRingV1 transport ABI. The operation request/response structures
  * above remain the canonical WinSpd transaction ABI. */
 #define SPD_RING_VERSION_1              1
+#define SPD_RING_MAX_QUEUE_DEPTH        4096
+#define SPD_RING_SLOT_MASK_WORD_BITS    64
+#define SPD_RING_SLOT_MASK_WORD_COUNT  \
+    (SPD_RING_MAX_QUEUE_DEPTH / SPD_RING_SLOT_MASK_WORD_BITS)
 #define SPD_RING_NO_BUFFER              ((UINT32)-1)
 #define SPD_RING_MAX_SECTION_BYTES      (256ULL * 1024ULL * 1024ULL)
 
@@ -245,11 +249,9 @@ typedef struct
     UINT32 Version;
     UINT32 HeaderSize;
     UINT32 SubmissionOffset;
-    UINT32 SubmissionCount;
     UINT32 CompletionOffset;
-    UINT32 CompletionCount;
     UINT32 BufferOffset;
-    UINT32 BufferCount;
+    UINT32 QueueDepth;
     UINT32 BufferSize;
     UINT32 Flags;
     UINT64 SubmissionProducer;
@@ -266,9 +268,7 @@ typedef struct
     UINT32 Btl;
     UINT16 Version;
     UINT16 Flags;
-    UINT32 SubmissionCount;
-    UINT32 CompletionCount;
-    UINT32 BufferCount;
+    UINT32 QueueDepth;
     UINT32 BufferSize;
     UINT64 UserAddress;
     UINT64 SectionSize;
@@ -290,6 +290,8 @@ typedef struct
     UINT32 MaxRequests;
     UINT32 Produced;
     UINT32 Reserved;
+    /* Slots userspace has released and permits this WAIT to claim. */
+    UINT64 AvailableSlots[SPD_RING_SLOT_MASK_WORD_COUNT];
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct

@@ -511,6 +511,8 @@ static UCHAR SpdScsiReadCapacity(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
         PREAD_CAPACITY_DATA_EX ReadCapacityData = DataBuffer;
         UINT64 U64;
         UINT32 U32;
+        UINT32 Ratio;
+        UINT32 OffsetBlocks;
         U64 = StorageUnit->StorageUnitParams.BlockCount - 1;
         ((PUINT8)&ReadCapacityData->LogicalBlockAddress)[0] = (U64 >> 56) & 0xff;
         ((PUINT8)&ReadCapacityData->LogicalBlockAddress)[1] = (U64 >> 48) & 0xff;
@@ -530,14 +532,16 @@ static UCHAR SpdScsiReadCapacity(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
         if (0 == U32)
             U32 = StorageUnit->StorageUnitParams.BlockLength;
         U32 /= StorageUnit->StorageUnitParams.BlockLength;
+        Ratio = U32;
         ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LogicalPerPhysicalExponent = 0;
         while (1 < U32)
         {
             ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LogicalPerPhysicalExponent++;
             U32 >>= 1;
         }
-        U32 = StorageUnit->StorageUnitParams.PhysicalBlockOffset /
+        OffsetBlocks = StorageUnit->StorageUnitParams.PhysicalBlockOffset /
             StorageUnit->StorageUnitParams.BlockLength;
+        U32 = (Ratio - (OffsetBlocks % Ratio)) % Ratio;
         ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LowestAlignedBlock_MSB =
             (U32 >> 8) & 0x3f;
         ((PREAD_CAPACITY16_DATA)ReadCapacityData)->LowestAlignedBlock_LSB =

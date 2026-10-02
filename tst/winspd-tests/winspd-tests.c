@@ -42,6 +42,7 @@ int main(int argc, char *argv[])
 {
     TESTSUITE(ioctl_tests);
     TESTSUITE(scsi_tests);
+    TESTSUITE(ring_tests);
 
     atexit(exiting);
     signal(SIGABRT, abort_handler);
