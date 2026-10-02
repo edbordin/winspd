@@ -8,10 +8,17 @@
 #include <winspd/winspd.h>
 #include <tlib/testsuite.h>
 #include <process.h>
+#include <setupapi.h>
+#include <ntddstor.h>
+#include <stdio.h>
+
+#pragma comment(lib, "setupapi.lib")
 
 typedef struct _RING_TEST_STATE
 {
     SPD_STORAGE_UNIT *StorageUnit;
+    GUID Guid;
+    WCHAR DiskPath[1024];
     HANDLE ReleaseReads;
     HANDLE TwoReadsStarted;
     SRWLOCK AsyncLock;
@@ -22,7 +29,8 @@ typedef struct _RING_TEST_STATE
     LONG AsyncThreadCount;
     LONG AsyncMode;
     LONG HoldReads;
-    LONG ReadCalls;
+    LONG ReadCallbacks;
+    LONG TestReadCalls;
     LONG Failure;
     UINT32 QueueDepth;
 } RING_TEST_STATE;
@@ -48,6 +56,150 @@ enum
     RingTestAsyncEarly,
     RingTestAsyncDeferred
 };
+
+static const GUID RingTestDiskInterfaceGuid =
+    { 0x53f56307, 0xb6bf, 0x11d0, { 0x94, 0xf2, 0x00, 0xa0, 0xc9, 0x1e, 0xfb, 0x8b } };
+static HANDLE RingTestDebugLogHandle = INVALID_HANDLE_VALUE;
+
+enum
+{
+    RingTestBlockAddress = 32,
+    RingTestDataLength = 512
+};
+
+static BOOL ring_test_disk_has_serial(PWSTR DiskPath, const char *ExpectedSerial)
+{
+    STORAGE_PROPERTY_QUERY Query;
+    union
+    {
+        LARGE_INTEGER Alignment;
+        UINT8 Bytes[4096];
+    } DescriptorBuffer;
+    PSTORAGE_DEVICE_DESCRIPTOR Descriptor;
+    HANDLE DiskHandle;
+    DWORD BytesReturned;
+    BOOL Result = FALSE;
+
+    DiskHandle = CreateFileW(DiskPath, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, 0);
+    if (INVALID_HANDLE_VALUE == DiskHandle)
+        return FALSE;
+
+    memset(&Query, 0, sizeof Query);
+    Query.PropertyId = StorageDeviceProperty;
+    Query.QueryType = PropertyStandardQuery;
+    if (DeviceIoControl(DiskHandle, IOCTL_STORAGE_QUERY_PROPERTY,
+        &Query, sizeof Query, DescriptorBuffer.Bytes,
+        sizeof DescriptorBuffer.Bytes, &BytesReturned, 0) &&
+        BytesReturned >= sizeof(STORAGE_DEVICE_DESCRIPTOR))
+    {
+        Descriptor = (PSTORAGE_DEVICE_DESCRIPTOR)DescriptorBuffer.Bytes;
+        if (0 != Descriptor->SerialNumberOffset &&
+            Descriptor->SerialNumberOffset < BytesReturned)
+        {
+            char *Serial = (char *)DescriptorBuffer.Bytes +
+                Descriptor->SerialNumberOffset;
+            size_t SerialLength = strnlen(Serial,
+                BytesReturned - Descriptor->SerialNumberOffset);
+            while (0 < SerialLength && ' ' == Serial[SerialLength - 1])
+                Serial[--SerialLength] = '\0';
+            Result = 0 == _stricmp(Serial, ExpectedSerial);
+        }
+    }
+
+    CloseHandle(DiskHandle);
+    return Result;
+}
+
+static BOOL ring_test_find_disk(RING_TEST_STATE *State, const GUID *Guid)
+{
+    char ExpectedSerial[37];
+    WCHAR CandidatePath[64];
+
+    sprintf_s(ExpectedSerial, sizeof ExpectedSerial,
+        "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        Guid->Data1, Guid->Data2, Guid->Data3,
+        Guid->Data4[0], Guid->Data4[1], Guid->Data4[2], Guid->Data4[3],
+        Guid->Data4[4], Guid->Data4[5], Guid->Data4[6], Guid->Data4[7]);
+
+    HDEVINFO DeviceInfoSet = SetupDiGetClassDevsW(
+            &RingTestDiskInterfaceGuid, 0, 0,
+            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (INVALID_HANDLE_VALUE != DeviceInfoSet)
+        {
+            for (DWORD Index = 0;; Index++)
+            {
+                SP_DEVICE_INTERFACE_DATA InterfaceData;
+                SP_DEVINFO_DATA DeviceInfoData;
+                DWORD RequiredSize = 0;
+                PSP_DEVICE_INTERFACE_DETAIL_DATA_W DetailData;
+                WCHAR InstanceId[256];
+                BOOL Found = FALSE;
+
+                memset(&InterfaceData, 0, sizeof InterfaceData);
+                InterfaceData.cbSize = sizeof InterfaceData;
+                memset(&DeviceInfoData, 0, sizeof DeviceInfoData);
+                DeviceInfoData.cbSize = sizeof DeviceInfoData;
+                if (!SetupDiEnumDeviceInterfaces(DeviceInfoSet, 0,
+                    &RingTestDiskInterfaceGuid, Index, &InterfaceData))
+                    break;
+
+                SetupDiGetDeviceInterfaceDetailW(DeviceInfoSet,
+                    &InterfaceData, 0, 0, &RequiredSize, 0);
+                if (0 == RequiredSize)
+                    continue;
+                DetailData = malloc(RequiredSize);
+                if (0 == DetailData)
+                    continue;
+                memset(DetailData, 0, RequiredSize);
+                DetailData->cbSize = sizeof *DetailData;
+                if (SetupDiGetDeviceInterfaceDetailW(DeviceInfoSet,
+                    &InterfaceData, DetailData, RequiredSize, 0,
+                    &DeviceInfoData) &&
+                    SetupDiGetDeviceInstanceIdW(DeviceInfoSet,
+                        &DeviceInfoData, InstanceId, ARRAYSIZE(InstanceId), 0) &&
+                    0 == _wcsnicmp(InstanceId,
+                        L"SCSI\\Disk&Ven_WinSpd", 20))
+                {
+                    if (ARRAYSIZE(State->DiskPath) >
+                        wcslen(DetailData->DevicePath))
+                    {
+                        /* The test requires no other present WinSpd LU, so
+                         * this interface belongs to the unit just provisioned. */
+                        wcscpy_s(State->DiskPath,
+                            ARRAYSIZE(State->DiskPath),
+                            DetailData->DevicePath);
+                        Found = TRUE;
+                    }
+                }
+                free(DetailData);
+                if (Found)
+                    break;
+            }
+            SetupDiDestroyDeviceInfoList(DeviceInfoSet);
+        }
+        if (L'\0' != State->DiskPath[0])
+            return TRUE;
+
+        /* Some Storport virtual disks become visible through PhysicalDrive
+         * before SetupAPI reports their disk interface. Scan that namespace
+         * as a fallback while PnP finishes publishing the interface. */
+    for (DWORD Drive = 0; Drive < 64; Drive++)
+        {
+            if (0 > _snwprintf_s(CandidatePath,
+                ARRAYSIZE(CandidatePath), _TRUNCATE,
+                L"\\\\.\\PhysicalDrive%lu", (unsigned long)Drive))
+                continue;
+            if (ring_test_disk_has_serial(CandidatePath, ExpectedSerial))
+            {
+                wcscpy_s(State->DiskPath, ARRAYSIZE(State->DiskPath),
+                    CandidatePath);
+                return TRUE;
+            }
+    }
+    return FALSE;
+}
 
 static const GUID RingTestGuidLifecycle =
     { 0x51aeb043, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x01 } };
@@ -82,9 +234,12 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
     SPD_STORAGE_UNIT_OPERATION_CONTEXT *OperationContext;
     LONG AsyncMode;
     LONG ReadCall;
+    BOOLEAN IsTestRead;
 
-    UNREFERENCED_PARAMETER(BlockAddress);
     UNREFERENCED_PARAMETER(Flush);
+    InterlockedIncrement(&State->ReadCallbacks);
+    IsTestRead = RingTestBlockAddress <= BlockAddress &&
+        BlockAddress < RingTestBlockAddress + 16;
     memset(Status, 0, sizeof *Status);
     OperationContext = SpdStorageUnitGetOperationContext();
     if (0 == OperationContext || 0 == OperationContext->Request)
@@ -106,8 +261,9 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
             ReleaseSRWLockExclusive(&State->TokenLock);
         }
     }
-    ReadCall = InterlockedIncrement(&State->ReadCalls);
-    if (0 != InterlockedCompareExchange(&State->HoldReads, 0, 0))
+    ReadCall = IsTestRead ? InterlockedIncrement(&State->TestReadCalls) : 0;
+    if (IsTestRead &&
+        0 != InterlockedCompareExchange(&State->HoldReads, 0, 0))
     {
         if (2 <= ReadCall)
             SetEvent(State->TwoReadsStarted);
@@ -121,7 +277,9 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
         memset(Buffer, 0x5a,
             (SIZE_T)BlockCount * StorageUnit->StorageUnitParams.BlockLength);
 
-    AsyncMode = InterlockedCompareExchange(&State->AsyncMode, 0, 0);
+    AsyncMode = IsTestRead ?
+        InterlockedCompareExchange(&State->AsyncMode, 0, 0) :
+        RingTestAsyncNone;
     if (RingTestAsyncNone != AsyncMode)
     {
         RING_TEST_ASYNC_RESPONSE *Work;
@@ -217,6 +375,7 @@ static VOID ring_test_create(RING_TEST_STATE *State, const GUID *Guid,
     memset(State, 0, sizeof *State);
     InitializeSRWLock(&State->AsyncLock);
     InitializeSRWLock(&State->TokenLock);
+    State->Guid = *Guid;
     State->QueueDepth = QueueDepth;
     State->ReleaseReads = CreateEventW(0, TRUE, FALSE, 0);
     State->TwoReadsStarted = CreateEventW(0, TRUE, FALSE, 0);
@@ -225,6 +384,7 @@ static VOID ring_test_create(RING_TEST_STATE *State, const GUID *Guid,
 
     memset(&Params, 0, sizeof Params);
     Params.Guid = *Guid;
+    memcpy(Params.ProductId, "RingTest", sizeof "RingTest");
     Params.BlockCount = 64;
     Params.BlockLength = 512;
     Params.MaxTransferLength = 4096;
@@ -232,6 +392,17 @@ static VOID ring_test_create(RING_TEST_STATE *State, const GUID *Guid,
         &State->StorageUnit);
     ASSERT(ERROR_SUCCESS == Error);
     State->StorageUnit->UserContext = State;
+    SpdStorageUnitSetDebugLog(State->StorageUnit,
+        1 << SpdIoctlTransactReadKind);
+    if (INVALID_HANDLE_VALUE == RingTestDebugLogHandle)
+    {
+        RingTestDebugLogHandle = CreateFileW(
+            L"artifacts\\ring-dispatcher.log", GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, 0, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL, 0);
+        if (INVALID_HANDLE_VALUE != RingTestDebugLogHandle)
+            SpdDebugLogSetHandle(RingTestDebugLogHandle);
+    }
 
     memset(&RingParams, 0, sizeof RingParams);
     RingParams.Version = SPD_RING_VERSION_1;
@@ -243,9 +414,6 @@ static VOID ring_test_create(RING_TEST_STATE *State, const GUID *Guid,
     ASSERT(QueueDepth == State->StorageUnit->SharedRingHeader->QueueDepth);
     ASSERT(4096 == State->StorageUnit->SharedRingHeader->BufferSize);
 
-    Error = SpdIoctlScsiInquiry(State->StorageUnit->Handle,
-        State->StorageUnit->Btl, 0, 3000);
-    ASSERT(ERROR_SUCCESS == Error);
 }
 
 static VOID ring_test_start(RING_TEST_STATE *State, ULONG WorkerCount)
@@ -253,6 +421,23 @@ static VOID ring_test_start(RING_TEST_STATE *State, ULONG WorkerCount)
     DWORD Error = SpdStorageUnitStartDispatcher(State->StorageUnit,
         WorkerCount);
     ASSERT(ERROR_SUCCESS == Error);
+
+    ULONGLONG Deadline = GetTickCount64() + 15000;
+    while (!ring_test_find_disk(State, &State->Guid) &&
+        GetTickCount64() < Deadline)
+        Sleep(100);
+    if (L'\0' == State->DiskPath[0])
+    {
+        DWORD DispatcherError = ERROR_SUCCESS;
+        SpdStorageUnitGetDispatcherError(State->StorageUnit,
+            &DispatcherError);
+        tlib_printf("ring discovery timeout: dispatcher=%lu callbackFailure=%ld readCallbacks=%ld testReads=%ld\n",
+            (unsigned long)DispatcherError,
+            InterlockedCompareExchange(&State->Failure, 0, 0),
+            InterlockedCompareExchange(&State->ReadCallbacks, 0, 0),
+            InterlockedCompareExchange(&State->TestReadCalls, 0, 0));
+    }
+    ASSERT(L'\0' != State->DiskPath[0]);
 }
 
 static VOID ring_test_join_async_threads(RING_TEST_STATE *State)
@@ -279,6 +464,9 @@ static VOID ring_test_destroy(RING_TEST_STATE *State)
         SpdStorageUnitWaitDispatcher(State->StorageUnit);
         SpdStorageUnitGetDispatcherError(State->StorageUnit,
             &DispatcherError);
+        if (ERROR_SUCCESS != DispatcherError)
+            tlib_printf("ring dispatcher error=%lu\n",
+                (unsigned long)DispatcherError);
         ASSERT(ERROR_SUCCESS == DispatcherError);
         ASSERT(0 == InterlockedCompareExchange(&State->Failure, 0, 0));
         SpdStorageUnitDelete(State->StorageUnit);
@@ -290,36 +478,43 @@ static VOID ring_test_destroy(RING_TEST_STATE *State)
         CloseHandle(State->ReleaseReads);
 }
 
-static DWORD ring_test_scsi_read(RING_TEST_STATE *State)
+static DWORD ring_test_disk_read(RING_TEST_STATE *State)
 {
-    CDB Cdb;
-    UINT8 DataBuffer[512];
-    UINT32 DataLength = sizeof DataBuffer;
-    UCHAR ScsiStatus;
-    UCHAR Sense[32];
+    LARGE_INTEGER Offset;
+    UINT8 DataBuffer[RingTestDataLength];
+    DWORD BytesRead;
+    HANDLE DiskHandle;
     DWORD Error;
 
-    memset(&Cdb, 0, sizeof Cdb);
-    Cdb.READ16.OperationCode = SCSIOP_READ16;
-    Cdb.READ16.TransferLength[3] = 1;
-    Error = SpdIoctlScsiExecute(State->StorageUnit->Handle,
-        State->StorageUnit->Btl, &Cdb, +1, DataBuffer, &DataLength,
-        &ScsiStatus, Sense);
-    if (ERROR_SUCCESS == Error &&
-        (SCSISTAT_GOOD != ScsiStatus || sizeof DataBuffer != DataLength))
-        Error = ERROR_INVALID_DATA;
+    DiskHandle = CreateFileW(State->DiskPath, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, 0);
+    if (INVALID_HANDLE_VALUE == DiskHandle)
+        return GetLastError();
+
+    Offset.QuadPart = (LONGLONG)RingTestBlockAddress * RingTestDataLength;
+    if (!SetFilePointerEx(DiskHandle, Offset, 0, FILE_BEGIN))
+        Error = GetLastError();
+    else if (!ReadFile(DiskHandle, DataBuffer, sizeof DataBuffer,
+        &BytesRead, 0))
+        Error = GetLastError();
+    else
+        Error = sizeof DataBuffer == BytesRead ? ERROR_SUCCESS :
+            ERROR_INVALID_DATA;
+    CloseHandle(DiskHandle);
     return Error;
 }
 
-static DWORD WINAPI ring_test_scsi_read_thread(PVOID Data)
+static DWORD WINAPI ring_test_disk_read_thread(PVOID Data)
 {
     RING_TEST_READ_THREAD *ReadThread = Data;
-    ReadThread->Error = ring_test_scsi_read(ReadThread->State);
+    ReadThread->Error = ring_test_disk_read(ReadThread->State);
     SetEvent(ReadThread->Finished);
     return ReadThread->Error;
 }
 
-static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State)
+static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State,
+    PBOOLEAN PTestRead)
 {
     SPD_RING_HEADER *Header = State->StorageUnit->SharedRingHeader;
     UINT64 SubmissionConsumer =
@@ -334,6 +529,7 @@ static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State)
     SPD_RING_COMPLETION *Completion;
     SPD_IOCTL_RING_KICK_PARAMS KickParams;
 
+    *PTestRead = FALSE;
     if (SubmissionProducer - SubmissionConsumer != 1 ||
         CompletionProducer != CompletionConsumer)
         return ERROR_INVALID_DATA;
@@ -354,6 +550,9 @@ static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State)
             Header->BufferOffset +
             (SIZE_T)Request->Data.Slot * Header->BufferSize +
             Request->Data.Offset, 0, Request->Data.Length);
+    *PTestRead = SpdIoctlTransactReadKind == Request->Request.Kind &&
+        RingTestBlockAddress <= Request->Request.Op.Read.BlockAddress &&
+        Request->Request.Op.Read.BlockAddress < RingTestBlockAddress + 16;
 
     SpdRingStoreCounter(&Header->SubmissionConsumer,
         SubmissionConsumer + 1);
@@ -369,27 +568,42 @@ static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State)
     return 1 == KickParams.Consumed ? ERROR_SUCCESS : ERROR_INVALID_DATA;
 }
 
+static VOID ring_test_wait_for_disk_manual(RING_TEST_STATE *State)
+{
+    ULONGLONG Deadline = GetTickCount64() + 15000;
+
+    while (!ring_test_find_disk(State, &State->Guid) &&
+        GetTickCount64() < Deadline)
+    {
+        SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
+        BOOLEAN TestRead;
+        DWORD Error;
+
+        memset(&WaitParams, 0, sizeof WaitParams);
+        WaitParams.MaxRequests = 1;
+        Error = SpdIoctlRingWait(State->StorageUnit->Handle,
+            State->StorageUnit->Btl, &WaitParams);
+        ASSERT(ERROR_SUCCESS == Error);
+        if (0 == WaitParams.Produced)
+            continue;
+        ASSERT(1 == WaitParams.Produced);
+        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(
+            State, &TestRead));
+        ASSERT(!TestRead);
+    }
+
+    ASSERT(L'\0' != State->DiskPath[0]);
+}
+
 static void ioctl_ring_lifecycle_test(void)
 {
     RING_TEST_STATE State;
-    DWORD Error;
 
     ring_test_create(&State, &RingTestGuidLifecycle, 2);
     ASSERT(0 != State.StorageUnit->SharedRingAddress);
     ASSERT(0 < State.StorageUnit->SharedRingSize);
     SpdStorageUnitCloseSharedRing(State.StorageUnit);
     ASSERT(0 == State.StorageUnit->SharedRingAddress);
-
-    SPD_IOCTL_RING_OPEN_PARAMS Params;
-    memset(&Params, 0, sizeof Params);
-    Params.Version = SPD_RING_VERSION_1;
-    Params.QueueDepth = 2;
-    Params.BufferSize = 4096;
-    Error = SpdStorageUnitOpenSharedRing(State.StorageUnit, &Params);
-    ASSERT(ERROR_SUCCESS == Error);
-    ASSERT(2 == State.StorageUnit->SharedRingHeader->QueueDepth);
-
-    ring_test_start(&State, 1);
     ring_test_destroy(&State);
 }
 
@@ -402,7 +616,7 @@ static void ioctl_ring_wraparound_test(void)
     ring_test_start(&State, 2);
     Header = State.StorageUnit->SharedRingHeader;
     for (UINT32 I = 0; I < 8; I++)
-        ASSERT(ERROR_SUCCESS == ring_test_scsi_read(&State));
+        ASSERT(ERROR_SUCCESS == ring_test_disk_read(&State));
     ASSERT(8 <= SpdRingLoadCounter(&Header->SubmissionProducer));
     ASSERT(8 <= SpdRingLoadCounter(&Header->SubmissionConsumer));
     ASSERT(8 <= SpdRingLoadCounter(&Header->CompletionProducer));
@@ -417,9 +631,9 @@ static void ioctl_ring_async_response_test(void)
     ring_test_create(&State, &RingTestGuidAsync, 2);
     ring_test_start(&State, 2);
     InterlockedExchange(&State.AsyncMode, RingTestAsyncEarly);
-    ASSERT(ERROR_SUCCESS == ring_test_scsi_read(&State));
+    ASSERT(ERROR_SUCCESS == ring_test_disk_read(&State));
     InterlockedExchange(&State.AsyncMode, RingTestAsyncDeferred);
-    ASSERT(ERROR_SUCCESS == ring_test_scsi_read(&State));
+    ASSERT(ERROR_SUCCESS == ring_test_disk_read(&State));
     InterlockedExchange(&State.AsyncMode, RingTestAsyncNone);
     ring_test_join_async_threads(&State);
     ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
@@ -443,7 +657,7 @@ static void ioctl_ring_saturation_test(void)
         Reads[I].Finished = CreateEventW(0, TRUE, FALSE, 0);
         ASSERT(0 != Reads[I].Finished);
         Threads[I] = CreateThread(0, 0,
-            ring_test_scsi_read_thread, &Reads[I], 0, 0);
+            ring_test_disk_read_thread, &Reads[I], 0, 0);
         ASSERT(0 != Threads[I]);
     }
 
@@ -468,8 +682,10 @@ static void ioctl_ring_wait_credit_test(void)
     RING_TEST_STATE State;
     RING_TEST_READ_THREAD Reads[4];
     HANDLE Threads[4];
+    UINT32 CompletedTestReads = 0;
 
     ring_test_create(&State, &RingTestGuidWaitCredit, 4);
+    ring_test_wait_for_disk_manual(&State);
     memset(Reads, 0, sizeof Reads);
     memset(Threads, 0, sizeof Threads);
     for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
@@ -478,20 +694,24 @@ static void ioctl_ring_wait_credit_test(void)
         Reads[I].Finished = CreateEventW(0, TRUE, FALSE, 0);
         ASSERT(0 != Reads[I].Finished);
         Threads[I] = CreateThread(0, 0,
-            ring_test_scsi_read_thread, &Reads[I], 0, 0);
+            ring_test_disk_read_thread, &Reads[I], 0, 0);
         ASSERT(0 != Threads[I]);
     }
 
-    for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
+    while (CompletedTestReads < ARRAYSIZE(Reads))
     {
         SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
+        BOOLEAN TestRead;
         memset(&WaitParams, 0, sizeof WaitParams);
         WaitParams.MaxRequests = 1;
         ASSERT(ERROR_SUCCESS == SpdIoctlRingWait(
             State.StorageUnit->Handle, State.StorageUnit->Btl,
             &WaitParams));
         ASSERT(1 == WaitParams.Produced);
-        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(&State));
+        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(
+            &State, &TestRead));
+        if (TestRead)
+            CompletedTestReads++;
     }
 
     for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
