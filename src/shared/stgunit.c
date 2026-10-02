@@ -684,6 +684,8 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
         return ERROR_INVALID_PARAMETER;
     if (0 == WorkerCount)
         WorkerCount = 1;
+    if (WorkerCount > Header->QueueDepth)
+        WorkerCount = Header->QueueDepth;
     if (1024 < WorkerCount)
         WorkerCount = 1024;
 
@@ -844,6 +846,7 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
         SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
         UINT64 Consumer;
         UINT64 Producer;
+        UINT32 WaitCredits;
 
         AcquireSRWLockExclusive(&Runtime->Lock);
         while (0 == Runtime->FreeCount && !Runtime->Stop)
@@ -854,9 +857,11 @@ static DWORD WINAPI SpdStorageUnitRingDispatcherThread(PVOID StorageUnit0)
             ReleaseSRWLockExclusive(&Runtime->Lock);
             break;
         }
+        WaitCredits = Runtime->FreeCount;
         ReleaseSRWLockExclusive(&Runtime->Lock);
 
         memset(&WaitParams, 0, sizeof WaitParams);
+        WaitParams.MaxRequests = WaitCredits;
         Error = SpdStorageUnitHandleRingWait(StorageUnit->Handle,
             StorageUnit->Btl, &WaitParams);
         if (ERROR_SUCCESS != Error)

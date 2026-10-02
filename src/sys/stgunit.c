@@ -222,9 +222,6 @@ NTSTATUS SpdStorageUnitRingOpen(
     KeInitializeSpinLock(&StorageUnit->RingLock);
     StorageUnit->RingWaitActive = FALSE;
     StorageUnit->RingFailed = FALSE;
-    StorageUnit->RingGeneration++;
-    if (0 == StorageUnit->RingGeneration)
-        StorageUnit->RingGeneration = 1;
     StorageUnit->RingPending = Pending;
     KeInitializeEvent(&StorageUnit->RingIdleEvent,
         NotificationEvent, TRUE);
@@ -405,6 +402,9 @@ NTSTATUS SpdStorageUnitRingWait(
 
     if (ProcessId != StorageUnit->TransactProcessId)
         return STATUS_ACCESS_DENIED;
+    if (0 == Params->MaxRequests ||
+        Params->MaxRequests > StorageUnit->RingQueueDepth)
+        return STATUS_INVALID_PARAMETER;
     if (!SpdStorageUnitRingEnter(StorageUnit))
         return STATUS_INVALID_DEVICE_STATE;
 
@@ -440,7 +440,8 @@ NTSTATUS SpdStorageUnitRingWait(
         return Result;
     }
 
-    while (Produced < StorageUnit->RingQueueDepth)
+    while (Produced < Params->MaxRequests &&
+        Produced < StorageUnit->RingQueueDepth)
     {
         SPD_RING_REQUEST *RingRequest;
         PVOID DataBuffer;
@@ -557,11 +558,13 @@ NTSTATUS SpdStorageUnitRingWait(
             RingRequest->Data.Flags = 0;
 
             {
-                UINT64 Token =
-                    ((UINT64)StorageUnit->RingGeneration << 32) | Slot;
+                UINT64 Token;
                 KIRQL Irql;
                 KeAcquireSpinLock(&StorageUnit->RingLock, &Irql);
+                Token = ((UINT64)++StorageUnit->RingRequestSequence << 32) |
+                    Slot;
                 StorageUnit->RingPending[Slot].SrbExtension = SrbExtension;
+                StorageUnit->RingPending[Slot].Token = Token;
                 StorageUnit->RingPending[Slot].DataLength = (UINT32)DataLength64;
                 StorageUnit->RingPending[Slot].Kind = RingRequest->Request.Kind;
                 RingRequest->Request.Hint = Token;
@@ -625,8 +628,7 @@ NTSTATUS SpdStorageUnitRingKick(
         SPD_RING_PENDING Pending;
         PVOID DataBuffer;
 
-        if ((UINT32)(Token >> 32) != StorageUnit->RingGeneration ||
-            Slot >= StorageUnit->RingQueueDepth)
+        if (Slot >= StorageUnit->RingQueueDepth)
         {
             StorageUnit->RingFailed = TRUE;
             SpdStorageUnitRingLeave(StorageUnit);
@@ -639,7 +641,7 @@ NTSTATUS SpdStorageUnitRingKick(
             Pending = StorageUnit->RingPending[Slot];
             KeReleaseSpinLock(&StorageUnit->RingLock, Irql);
         }
-        if (!Pending.InUse ||
+        if (!Pending.InUse || Pending.Token != Token ||
             Pending.Kind != Completion->Response.Kind)
         {
             StorageUnit->RingFailed = TRUE;

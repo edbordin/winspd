@@ -15,12 +15,16 @@ typedef struct _RING_TEST_STATE
     HANDLE ReleaseReads;
     HANDLE TwoReadsStarted;
     SRWLOCK AsyncLock;
+    SRWLOCK TokenLock;
     HANDLE AsyncThreads[16];
+    UINT64 TokensBySlot[4];
+    BOOLEAN TokenSeen[4];
     LONG AsyncThreadCount;
     LONG AsyncMode;
     LONG HoldReads;
     LONG ReadCalls;
     LONG Failure;
+    UINT32 QueueDepth;
 } RING_TEST_STATE;
 
 typedef struct _RING_TEST_ASYNC_RESPONSE
@@ -53,6 +57,8 @@ static const GUID RingTestGuidAsync =
     { 0x51aeb045, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x03 } };
 static const GUID RingTestGuidSaturation =
     { 0x51aeb046, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x04 } };
+static const GUID RingTestGuidWaitCredit =
+    { 0x51aeb047, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x05 } };
 
 static DWORD WINAPI ring_test_async_response_thread(PVOID Data)
 {
@@ -73,12 +79,33 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
     SPD_STORAGE_UNIT_STATUS *Status)
 {
     RING_TEST_STATE *State = StorageUnit->UserContext;
+    SPD_STORAGE_UNIT_OPERATION_CONTEXT *OperationContext;
     LONG AsyncMode;
     LONG ReadCall;
 
     UNREFERENCED_PARAMETER(BlockAddress);
     UNREFERENCED_PARAMETER(Flush);
     memset(Status, 0, sizeof *Status);
+    OperationContext = SpdStorageUnitGetOperationContext();
+    if (0 == OperationContext || 0 == OperationContext->Request)
+        InterlockedExchange(&State->Failure, 1);
+    else
+    {
+        UINT64 Token = OperationContext->Request->Hint;
+        UINT32 Slot = (UINT32)Token;
+        if (Slot >= State->QueueDepth || Slot >= ARRAYSIZE(State->TokensBySlot))
+            InterlockedExchange(&State->Failure, 1);
+        else
+        {
+            AcquireSRWLockExclusive(&State->TokenLock);
+            if (State->TokenSeen[Slot] &&
+                State->TokensBySlot[Slot] == Token)
+                InterlockedExchange(&State->Failure, 1);
+            State->TokensBySlot[Slot] = Token;
+            State->TokenSeen[Slot] = TRUE;
+            ReleaseSRWLockExclusive(&State->TokenLock);
+        }
+    }
     ReadCall = InterlockedIncrement(&State->ReadCalls);
     if (0 != InterlockedCompareExchange(&State->HoldReads, 0, 0))
     {
@@ -97,8 +124,6 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
     AsyncMode = InterlockedCompareExchange(&State->AsyncMode, 0, 0);
     if (RingTestAsyncNone != AsyncMode)
     {
-        SPD_STORAGE_UNIT_OPERATION_CONTEXT *OperationContext =
-            SpdStorageUnitGetOperationContext();
         RING_TEST_ASYNC_RESPONSE *Work;
         HANDLE Thread;
         HANDLE SentEvent = 0;
@@ -191,6 +216,8 @@ static VOID ring_test_create(RING_TEST_STATE *State, const GUID *Guid,
 
     memset(State, 0, sizeof *State);
     InitializeSRWLock(&State->AsyncLock);
+    InitializeSRWLock(&State->TokenLock);
+    State->QueueDepth = QueueDepth;
     State->ReleaseReads = CreateEventW(0, TRUE, FALSE, 0);
     State->TwoReadsStarted = CreateEventW(0, TRUE, FALSE, 0);
     ASSERT(0 != State->ReleaseReads);
@@ -292,6 +319,56 @@ static DWORD WINAPI ring_test_scsi_read_thread(PVOID Data)
     return ReadThread->Error;
 }
 
+static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State)
+{
+    SPD_RING_HEADER *Header = State->StorageUnit->SharedRingHeader;
+    UINT64 SubmissionConsumer =
+        SpdRingLoadCounter(&Header->SubmissionConsumer);
+    UINT64 SubmissionProducer =
+        SpdRingLoadCounter(&Header->SubmissionProducer);
+    UINT64 CompletionConsumer =
+        SpdRingLoadCounter(&Header->CompletionConsumer);
+    UINT64 CompletionProducer =
+        SpdRingLoadCounter(&Header->CompletionProducer);
+    SPD_RING_REQUEST *Request;
+    SPD_RING_COMPLETION *Completion;
+    SPD_IOCTL_RING_KICK_PARAMS KickParams;
+
+    if (SubmissionProducer - SubmissionConsumer != 1 ||
+        CompletionProducer != CompletionConsumer)
+        return ERROR_INVALID_DATA;
+
+    Request = (SPD_RING_REQUEST *)
+        ((PUINT8)State->StorageUnit->SharedRingAddress +
+        Header->SubmissionOffset +
+        (SubmissionConsumer % Header->QueueDepth) * sizeof *Request);
+    Completion = (SPD_RING_COMPLETION *)
+        ((PUINT8)State->StorageUnit->SharedRingAddress +
+        Header->CompletionOffset +
+        (CompletionProducer % Header->QueueDepth) * sizeof *Completion);
+    memset(&Completion->Response, 0, sizeof Completion->Response);
+    Completion->Response.Hint = Request->Request.Hint;
+    Completion->Response.Kind = Request->Request.Kind;
+    if (Request->Data.Slot != SPD_RING_NO_BUFFER)
+        memset((PUINT8)State->StorageUnit->SharedRingAddress +
+            Header->BufferOffset +
+            (SIZE_T)Request->Data.Slot * Header->BufferSize +
+            Request->Data.Offset, 0, Request->Data.Length);
+
+    SpdRingStoreCounter(&Header->SubmissionConsumer,
+        SubmissionConsumer + 1);
+    SpdRingStoreCounter(&Header->CompletionProducer,
+        CompletionProducer + 1);
+    memset(&KickParams, 0, sizeof KickParams);
+    {
+        DWORD Error = SpdIoctlRingKick(State->StorageUnit->Handle,
+            State->StorageUnit->Btl, &KickParams);
+        if (ERROR_SUCCESS != Error)
+            return Error;
+    }
+    return 1 == KickParams.Consumed ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+}
+
 static void ioctl_ring_lifecycle_test(void)
 {
     RING_TEST_STATE State;
@@ -386,10 +463,53 @@ static void ioctl_ring_saturation_test(void)
     ring_test_destroy(&State);
 }
 
+static void ioctl_ring_wait_credit_test(void)
+{
+    RING_TEST_STATE State;
+    RING_TEST_READ_THREAD Reads[4];
+    HANDLE Threads[4];
+
+    ring_test_create(&State, &RingTestGuidWaitCredit, 4);
+    memset(Reads, 0, sizeof Reads);
+    memset(Threads, 0, sizeof Threads);
+    for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
+    {
+        Reads[I].State = &State;
+        Reads[I].Finished = CreateEventW(0, TRUE, FALSE, 0);
+        ASSERT(0 != Reads[I].Finished);
+        Threads[I] = CreateThread(0, 0,
+            ring_test_scsi_read_thread, &Reads[I], 0, 0);
+        ASSERT(0 != Threads[I]);
+    }
+
+    for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
+    {
+        SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
+        memset(&WaitParams, 0, sizeof WaitParams);
+        WaitParams.MaxRequests = 1;
+        ASSERT(ERROR_SUCCESS == SpdIoctlRingWait(
+            State.StorageUnit->Handle, State.StorageUnit->Btl,
+            &WaitParams));
+        ASSERT(1 == WaitParams.Produced);
+        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(&State));
+    }
+
+    for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
+    {
+        ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(Threads[I], 10000));
+        ASSERT(ERROR_SUCCESS == Reads[I].Error);
+        CloseHandle(Threads[I]);
+        CloseHandle(Reads[I].Finished);
+    }
+    ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
+    ring_test_destroy(&State);
+}
+
 void ring_tests(void)
 {
     TEST(ioctl_ring_lifecycle_test);
     TEST(ioctl_ring_wraparound_test);
     TEST(ioctl_ring_async_response_test);
     TEST(ioctl_ring_saturation_test);
+    TEST(ioctl_ring_wait_credit_test);
 }

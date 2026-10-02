@@ -283,8 +283,9 @@ typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
+    UINT32 MaxRequests;
     UINT32 Produced;
-    UINT32 Reserved[2];
+    UINT32 Reserved;
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct
