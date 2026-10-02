@@ -112,7 +112,8 @@ static BOOL ring_test_disk_has_serial(PWSTR DiskPath, const char *ExpectedSerial
     return Result;
 }
 
-static BOOL ring_test_find_disk(RING_TEST_STATE *State, const GUID *Guid)
+static BOOL ring_test_find_disk(RING_TEST_STATE *State, const GUID *Guid,
+    BOOLEAN InterfaceOnly)
 {
     char ExpectedSerial[37];
     WCHAR CandidatePath[64];
@@ -181,6 +182,11 @@ static BOOL ring_test_find_disk(RING_TEST_STATE *State, const GUID *Guid)
         }
         if (L'\0' != State->DiskPath[0])
             return TRUE;
+
+        /* Manual ring tests must not make synchronous storage queries while
+         * they are the only consumer of ring requests. */
+        if (InterfaceOnly)
+            return FALSE;
 
         /* Some Storport virtual disks become visible through PhysicalDrive
          * before SetupAPI reports their disk interface. Scan that namespace
@@ -423,7 +429,7 @@ static VOID ring_test_start(RING_TEST_STATE *State, ULONG WorkerCount)
     ASSERT(ERROR_SUCCESS == Error);
 
     ULONGLONG Deadline = GetTickCount64() + 15000;
-    while (!ring_test_find_disk(State, &State->Guid) &&
+    while (!ring_test_find_disk(State, &State->Guid, FALSE) &&
         GetTickCount64() < Deadline)
         Sleep(100);
     if (L'\0' == State->DiskPath[0])
@@ -572,7 +578,7 @@ static VOID ring_test_wait_for_disk_manual(RING_TEST_STATE *State)
 {
     ULONGLONG Deadline = GetTickCount64() + 15000;
 
-    while (!ring_test_find_disk(State, &State->Guid) &&
+    while (!ring_test_find_disk(State, &State->Guid, TRUE) &&
         GetTickCount64() < Deadline)
     {
         SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
@@ -698,20 +704,48 @@ static void ioctl_ring_wait_credit_test(void)
         ASSERT(0 != Threads[I]);
     }
 
+    BOOLEAN WaitFailed = FALSE;
     while (CompletedTestReads < ARRAYSIZE(Reads))
     {
         SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
         BOOLEAN TestRead;
+        DWORD Error;
         memset(&WaitParams, 0, sizeof WaitParams);
         WaitParams.MaxRequests = 1;
-        ASSERT(ERROR_SUCCESS == SpdIoctlRingWait(
+        Error = SpdIoctlRingWait(
             State.StorageUnit->Handle, State.StorageUnit->Btl,
-            &WaitParams));
+            &WaitParams);
+        if (ERROR_SUCCESS != Error)
+        {
+            tlib_printf("wait-credit RING_WAIT failed: error=%lu (0x%08lx), produced=%lu, completed=%lu\n",
+                (unsigned long)Error, (unsigned long)Error,
+                (unsigned long)WaitParams.Produced,
+                (unsigned long)CompletedTestReads);
+            ASSERT(ERROR_SUCCESS == Error);
+            WaitFailed = TRUE;
+            break;
+        }
         ASSERT(1 == WaitParams.Produced);
         ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(
             &State, &TestRead));
         if (TestRead)
             CompletedTestReads++;
+    }
+
+    if (WaitFailed)
+    {
+        ring_test_destroy(&State);
+        for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
+        {
+            if (0 != Threads[I])
+            {
+                WaitForSingleObject(Threads[I], 10000);
+                CloseHandle(Threads[I]);
+            }
+            if (0 != Reads[I].Finished)
+                CloseHandle(Reads[I].Finished);
+        }
+        return;
     }
 
     for (UINT32 I = 0; I < ARRAYSIZE(Reads); I++)
