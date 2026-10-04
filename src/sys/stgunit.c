@@ -311,6 +311,12 @@ NTSTATUS SpdStorageUnitRingOpen(
     Header->BufferSize = Params->BufferSize;
 
     KeAcquireSpinLock(&Ring->Lock, &Irql);
+    if (ProcessId != StorageUnit->TransactProcessId)
+    {
+        KeReleaseSpinLock(&Ring->Lock, Irql);
+        Result = STATUS_ACCESS_DENIED;
+        goto exit;
+    }
     if (0 != Ring->SectionHandle || Ring->Stopping)
     {
         KeReleaseSpinLock(&Ring->Lock, Irql);

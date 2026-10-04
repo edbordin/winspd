@@ -266,6 +266,7 @@ static VOID SpdIoctlSetTransactProcessId(SPD_DEVICE_EXTENSION *DeviceExtension,
     PIRP Irp)
 {
     SPD_STORAGE_UNIT *StorageUnit = 0;
+    KIRQL Irql;
 
     if (sizeof *Params > InputBufferLength)
     {
@@ -280,10 +281,18 @@ static VOID SpdIoctlSetTransactProcessId(SPD_DEVICE_EXTENSION *DeviceExtension,
         goto exit;
     }
 
-    /* 32-bit store is atomic */
-    StorageUnit->TransactProcessId = Params->ProcessId;
+    /* Process ownership must remain stable while the ring is open. */
+    KeAcquireSpinLock(&StorageUnit->Ring.Lock, &Irql);
+    if (0 != StorageUnit->Ring.SectionHandle ||
+        StorageUnit->Ring.Stopping)
+        Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
+    else
+    {
+        StorageUnit->TransactProcessId = Params->ProcessId;
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&StorageUnit->Ring.Lock, Irql);
 
-    Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
 
 exit:;
