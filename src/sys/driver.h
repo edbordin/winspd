@@ -375,6 +375,7 @@ typedef struct
 
 typedef struct
 {
+    /* System VA owned by Mdl via MmGetSystemAddressForMdlSafe. */
     PVOID SystemAddress;
     SIZE_T SectionSize;
     UINT32 RequestOffset;

@@ -62,16 +62,15 @@ static VOID SpdStorageUnitRingReset(
         Ring->Mdl = 0;
     }
 
-    if (0 != Ring->UserAddress && !UserProcessExiting)
-    {
-        ZwUnmapViewOfSection(ZwCurrentProcess(), Ring->UserAddress);
-        Ring->UserAddress = 0;
-    }
+    /* The MDL owns the kernel mapping returned for its locked pages. */
+    Ring->SystemAddress = 0;
 
-    if (0 != Ring->SystemAddress)
+    if (0 != Ring->UserAddress)
     {
-        MmUnmapViewInSystemSpace(Ring->SystemAddress);
-        Ring->SystemAddress = 0;
+        if (!UserProcessExiting)
+            ZwUnmapViewOfSection(ZwCurrentProcess(), Ring->UserAddress);
+
+        Ring->UserAddress = 0;
     }
 
     if (0 != Ring->SectionHandle)
@@ -184,8 +183,8 @@ NTSTATUS SpdStorageUnitRingOpen(
     HANDLE SectionHandle = 0;
     PVOID SystemAddress = 0;
     PVOID UserAddress = 0;
-    PVOID SectionObject = 0;
     PMDL Mdl = 0;
+    BOOLEAN PagesLocked = FALSE;
     SIZE_T SectionSize;
     SIZE_T ViewSize;
     SIZE_T Offset;
@@ -256,30 +255,21 @@ NTSTATUS SpdStorageUnitRingOpen(
     if (!NT_SUCCESS(Result))
         goto exit;
 
-    Result = ObReferenceObjectByHandle(SectionHandle,
-        SECTION_MAP_READ | SECTION_MAP_WRITE, 0, KernelMode,
-        &SectionObject, 0);
-    if (!NT_SUCCESS(Result))
-        goto exit;
-
-    ViewSize = SectionSize;
-    Result = MmMapViewInSystemSpace(SectionObject, &SystemAddress,
-        &ViewSize);
-    ObDereferenceObject(SectionObject);
-    SectionObject = 0;
-    if (!NT_SUCCESS(Result))
-        goto exit;
-
     ViewSize = SectionSize;
     Result = ZwMapViewOfSection(SectionHandle, ZwCurrentProcess(),
         &UserAddress, 0, 0, 0, &ViewSize, ViewUnmap, 0, PAGE_READWRITE);
     if (!NT_SUCCESS(Result))
         goto exit;
+    if (ViewSize < SectionSize)
+    {
+        Result = STATUS_INSUFFICIENT_RESOURCES;
+        goto exit;
+    }
 
     /* Pin the pages because Storport prepare/complete callbacks may copy
      * payloads at DISPATCH_LEVEL. */
     Mdl = IoAllocateMdl(UserAddress, (ULONG)SectionSize,
-        FALSE, FALSE, 0);
+        FALSE, FALSE, NULL);
     if (0 == Mdl)
     {
         Result = STATUS_INSUFFICIENT_RESOURCES;
@@ -288,12 +278,20 @@ NTSTATUS SpdStorageUnitRingOpen(
     __try
     {
         MmProbeAndLockPages(Mdl, UserMode, IoModifyAccess);
+        PagesLocked = TRUE;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         Result = GetExceptionCode();
-        IoFreeMdl(Mdl);
-        Mdl = 0;
+        goto exit;
+    }
+
+    SystemAddress = MmGetSystemAddressForMdlSafe(
+        Mdl,
+        NormalPagePriority | MdlMappingNoExecute);
+    if (0 == SystemAddress)
+    {
+        Result = STATUS_INSUFFICIENT_RESOURCES;
         goto exit;
     }
 
@@ -346,29 +344,43 @@ NTSTATUS SpdStorageUnitRingOpen(
     Params->SectionSize = SectionSize;
     Params->Features = 0;
     SectionHandle = 0;
-    SystemAddress = 0;
     Mdl = 0;
     UserAddress = 0;
     FreeIds = 0;
     Meta = 0;
+    SystemAddress = 0;
+    PagesLocked = FALSE;
     Result = STATUS_SUCCESS;
 
 exit:
-    if (0 != SectionObject)
-        ObDereferenceObject(SectionObject);
     if (0 != Mdl)
     {
-        MmUnlockPages(Mdl);
+        if (PagesLocked)
+            MmUnlockPages(Mdl);
+
         IoFreeMdl(Mdl);
+        Mdl = 0;
     }
     if (0 != UserAddress)
+    {
         ZwUnmapViewOfSection(ZwCurrentProcess(), UserAddress);
-    if (0 != SystemAddress)
-        MmUnmapViewInSystemSpace(SystemAddress);
+        UserAddress = 0;
+    }
     if (0 != SectionHandle)
+    {
         ZwClose(SectionHandle);
-    SpdFree(FreeIds, SpdTagStorageUnit);
-    SpdFree(Meta, SpdTagStorageUnit);
+        SectionHandle = 0;
+    }
+    if (0 != FreeIds)
+    {
+        SpdFree(FreeIds, SpdTagStorageUnit);
+        FreeIds = 0;
+    }
+    if (0 != Meta)
+    {
+        SpdFree(Meta, SpdTagStorageUnit);
+        Meta = 0;
+    }
     return Result;
 }
 

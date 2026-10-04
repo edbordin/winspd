@@ -324,9 +324,12 @@ static inline UINT32 SpdRingLoadAcquire32(volatile UINT32 *Pointer)
 {
 #if defined(_M_ARM64)
     return __ldar32((volatile unsigned __int32 *)Pointer);
+#elif defined(_M_X64) || defined(_M_IX86)
+    UINT32 Value = *Pointer;
+    _ReadWriteBarrier();
+    return Value;
 #else
-    return (UINT32)InterlockedCompareExchange((volatile LONG *)Pointer,
-        0, 0);
+#error Unsupported architecture
 #endif
 }
 
@@ -335,8 +338,11 @@ static inline VOID SpdRingStoreRelease32(volatile UINT32 *Pointer,
 {
 #if defined(_M_ARM64)
     __stlr32((volatile unsigned __int32 *)Pointer, Value);
+#elif defined(_M_X64) || defined(_M_IX86)
+    _ReadWriteBarrier();
+    *Pointer = Value;
 #else
-    InterlockedExchange((volatile LONG *)Pointer, (LONG)Value);
+#error Unsupported architecture
 #endif
 }
 
