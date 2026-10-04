@@ -84,6 +84,11 @@ typedef struct _SPD_STORAGE_UNIT
     PVOID SharedRingAddress;
     SIZE_T SharedRingSize;
     SPD_RING_HEADER *SharedRingHeader;
+    UINT32 SharedRingQueueDepth;
+    UINT32 SharedRingBufferSize;
+    UINT32 SharedRingRequestOffset;
+    UINT32 SharedRingCompletionOffset;
+    UINT32 SharedRingBufferOffset;
     SRWLOCK SharedRingRuntimeLock;
     PVOID SharedRingRuntime;
 } SPD_STORAGE_UNIT;
@@ -152,13 +157,13 @@ BOOLEAN SpdStorageUnitProcessRequest(SPD_STORAGE_UNIT *StorageUnit,
     SPD_IOCTL_TRANSACT_REQ *Request, PVOID DataBuffer,
     SPD_IOCTL_TRANSACT_RSP *Response);
 /**
- * Establish the driver-owned SharedRingV1 mapping for a storage unit.
+ * Establish the driver-owned SharedRing V3 mapping for a storage unit.
  * The caller supplies Version and requested ring dimensions; the driver
  * fills UserAddress and SectionSize on success.
  */
 DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
     SPD_IOCTL_RING_OPEN_PARAMS *Params);
-/** Close and unmap the SharedRingV1 mapping, if enabled. */
+/** Close and unmap the SharedRing V3 mapping, if enabled. */
 VOID SpdStorageUnitCloseSharedRing(SPD_STORAGE_UNIT *StorageUnit);
 /**
  * Wait for the storage unit dispatcher to stop.
@@ -217,7 +222,9 @@ VOID SpdStorageUnitSetDispatcherError(SPD_STORAGE_UNIT *StorageUnit,
 {
     if (ERROR_SUCCESS == DispatcherError)
         return;
-    InterlockedCompareExchange(&StorageUnit->DispatcherError, DispatcherError, ERROR_SUCCESS);
+    InterlockedCompareExchange(
+        (volatile LONG *)&StorageUnit->DispatcherError,
+        (LONG)DispatcherError, ERROR_SUCCESS);
 }
 VOID SpdStorageUnitSetDispatcherErrorF(SPD_STORAGE_UNIT *StorageUnit,
     DWORD DispatcherError);

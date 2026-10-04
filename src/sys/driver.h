@@ -359,13 +359,47 @@ typedef struct _SPD_SRB_EXTENSION
 
 typedef struct
 {
-    PVOID SrbExtension;
-    UINT64 Token;
-    UINT32 DataLength;
+    UINT64 OwnerHint;
+    UINT32 Length;
     UINT8 Kind;
-    BOOLEAN InUse;
-    BOOLEAN WaitAvailable;
-} SPD_RING_PENDING;
+    UINT8 Allocated;
+    UINT16 Reserved;
+} SPD_RING_BUFFER_META;
+
+typedef struct
+{
+    UINT32 *FreeIds;
+    UINT32 FreeCount;
+    SPD_RING_BUFFER_META *Meta;
+} SPD_RING_BUFFER_POOL;
+
+typedef struct
+{
+    PVOID SystemAddress;
+    SIZE_T SectionSize;
+    UINT32 RequestOffset;
+    UINT32 CompletionOffset;
+    UINT32 BufferOffset;
+    UINT32 QueueDepth;
+    UINT32 BufferSize;
+    UINT32 RequestTail;
+    UINT32 CompletionHead;
+    SPD_RING_BUFFER_POOL Buffers;
+    KSPIN_LOCK Lock;
+    BOOLEAN WaitActive;
+    BOOLEAN KickActive;
+    BOOLEAN Stopping;
+    BOOLEAN Failed;
+    ULONG ActiveCalls;
+    KEVENT IdleEvent;
+    ULONG ProcessId;
+
+    /* Ring lifetime and mapping state. */
+    HANDLE SectionHandle;
+    PMDL Mdl;
+    PVOID UserAddress;
+    ULONG UserProcessId;
+} SPD_RING_STATE;
 
 /* storage units */
 typedef struct _SPD_STORAGE_UNIT SPD_STORAGE_UNIT;
@@ -388,25 +422,7 @@ typedef struct _SPD_STORAGE_UNIT
     /* fields not protected */
     PDEVICE_OBJECT DeviceObject;        /* disk device */
     ULONG TransactProcessId;
-    HANDLE RingSectionHandle;
-    PVOID RingSystemAddress;
-    PMDL RingMdl;
-    SIZE_T RingSectionSize;
-    PVOID RingUserAddress;
-    ULONG RingProcessId;
-    KSPIN_LOCK RingLock;
-    KEVENT RingIdleEvent;
-    ULONG RingActiveCalls;
-    BOOLEAN RingWaitActive;
-    BOOLEAN RingClosing;
-    BOOLEAN RingFailed;
-    UINT32 RingRequestSequence;
-    UINT32 RingQueueDepth;
-    UINT32 RingSubmissionOffset;
-    UINT32 RingCompletionOffset;
-    UINT32 RingBufferOffset;
-    UINT32 RingBufferSize;
-    SPD_RING_PENDING *RingPending;
+    SPD_RING_STATE Ring;
 } SPD_STORAGE_UNIT;
 NTSTATUS SpdDeviceExtensionInit(SPD_DEVICE_EXTENSION *DeviceExtension, PVOID BusInformation);
 VOID SpdDeviceExtensionFini(SPD_DEVICE_EXTENSION *DeviceExtension);

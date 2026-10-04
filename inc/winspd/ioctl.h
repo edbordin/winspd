@@ -22,6 +22,8 @@
 #ifndef WINSPD_IOCTL_H_INCLUDED
 #define WINSPD_IOCTL_H_INCLUDED
 
+#include <intrin.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -203,26 +205,26 @@ typedef struct
     UINT32 ProcessId;
 } SPD_IOCTL_SET_TRANSACT_PID_PARAMS;
 
-/* SharedRingV1 transport ABI. The operation request/response structures
- * above remain the canonical WinSpd transaction ABI. */
-#define SPD_RING_VERSION_1              1
+/* SharedRing V3 transports, but does not redefine, the canonical WinSpd
+ * transaction request and response structures above. */
+#define SPD_RING_VERSION_3              3
+#define SPD_RING_CACHE_LINE_SIZE        64
+#define SPD_RING_MIN_QUEUE_DEPTH        2
 #define SPD_RING_MAX_QUEUE_DEPTH        4096
-#define SPD_RING_SLOT_MASK_WORD_BITS    64
-#define SPD_RING_SLOT_MASK_WORD_COUNT  \
-    (SPD_RING_MAX_QUEUE_DEPTH / SPD_RING_SLOT_MASK_WORD_BITS)
 #define SPD_RING_NO_BUFFER              ((UINT32)-1)
 #define SPD_RING_MAX_SECTION_BYTES      (256ULL * 1024ULL * 1024ULL)
+#define SPD_RING_BUFFER_FLAG_NONE       0
 
 typedef struct
 {
-    UINT32 Slot;
+    UINT32 BufferId;
     UINT32 Offset;
     UINT32 Length;
     UINT32 Flags;
 } SPD_RING_BUFFER_REF;
 #if defined(WINSPD_SYS_INTERNAL)
 static_assert(16 == sizeof(SPD_RING_BUFFER_REF),
-    "16 == sizeof(SPD_RING_BUFFER_REF)");
+    "unexpected SPD_RING_BUFFER_REF size");
 #endif
 
 typedef struct
@@ -234,32 +236,46 @@ typedef struct
 typedef struct
 {
     SPD_IOCTL_TRANSACT_RSP Response;
+    SPD_RING_BUFFER_REF Data;
 } SPD_RING_COMPLETION;
 
 #if defined(WINSPD_SYS_INTERNAL)
 static_assert(sizeof(SPD_RING_REQUEST) ==
     sizeof(SPD_IOCTL_TRANSACT_REQ) + sizeof(SPD_RING_BUFFER_REF),
-    "ring request must remain an envelope around the transaction request");
-static_assert(sizeof(SPD_RING_COMPLETION) == sizeof(SPD_IOCTL_TRANSACT_RSP),
-    "ring completion must preserve the transaction response ABI");
+    "ring request must envelope canonical request");
+static_assert(sizeof(SPD_RING_COMPLETION) ==
+    sizeof(SPD_IOCTL_TRANSACT_RSP) + sizeof(SPD_RING_BUFFER_REF),
+    "ring completion must envelope canonical response");
+#endif
+
+typedef __declspec(align(SPD_RING_CACHE_LINE_SIZE))
+struct _SPD_RING_CURSOR
+{
+    volatile UINT32 Value;
+    UINT8 Reserved[SPD_RING_CACHE_LINE_SIZE - sizeof(UINT32)];
+} SPD_RING_CURSOR;
+
+#if defined(WINSPD_SYS_INTERNAL)
+static_assert(SPD_RING_CACHE_LINE_SIZE == sizeof(SPD_RING_CURSOR),
+    "ring cursor must occupy one cache line");
 #endif
 
 typedef struct
 {
     UINT32 Version;
     UINT32 HeaderSize;
-    UINT32 SubmissionOffset;
+    UINT32 RequestOffset;
     UINT32 CompletionOffset;
     UINT32 BufferOffset;
     UINT32 QueueDepth;
+    UINT32 BufferCount;
     UINT32 BufferSize;
     UINT32 Flags;
-    UINT64 SubmissionProducer;
-    UINT64 SubmissionConsumer;
-    UINT64 CompletionProducer;
-    UINT64 CompletionConsumer;
-    UINT64 KernelHeartbeat;
-    UINT64 UserHeartbeat;
+    UINT32 Reserved[7];
+    SPD_RING_CURSOR RequestHead;
+    SPD_RING_CURSOR RequestTail;
+    SPD_RING_CURSOR CompletionHead;
+    SPD_RING_CURSOR CompletionTail;
 } SPD_RING_HEADER;
 
 typedef struct
@@ -283,15 +299,15 @@ typedef struct
     UINT32 Reserved;
 } SPD_IOCTL_RING_CLOSE_PARAMS;
 
+#define SPD_RING_WAIT_FLAG_BUFFER_STARVED 0x00000001
+
 typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
     UINT32 MaxRequests;
     UINT32 Produced;
-    UINT32 Reserved;
-    /* Slots userspace has released and permits this WAIT to claim. */
-    UINT64 AvailableSlots[SPD_RING_SLOT_MASK_WORD_COUNT];
+    UINT32 Flags;
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct
@@ -303,17 +319,25 @@ typedef struct
 } SPD_IOCTL_RING_KICK_PARAMS;
 #pragma warning(pop)
 
-/* These helpers deliberately use interlocked operations rather than volatile
- * as the synchronization mechanism for counters shared by kernel and user. */
-static inline UINT64 SpdRingLoadCounter(UINT64 *Counter)
+/* Shared cursors must use acquire/release semantics. */
+static inline UINT32 SpdRingLoadAcquire32(volatile UINT32 *Pointer)
 {
-    return (UINT64)InterlockedCompareExchange64(
-        (volatile LONG64 *)Counter, 0, 0);
+#if defined(_M_ARM64)
+    return __ldar32((volatile unsigned __int32 *)Pointer);
+#else
+    return (UINT32)InterlockedCompareExchange((volatile LONG *)Pointer,
+        0, 0);
+#endif
 }
 
-static inline VOID SpdRingStoreCounter(UINT64 *Counter, UINT64 Value)
+static inline VOID SpdRingStoreRelease32(volatile UINT32 *Pointer,
+    UINT32 Value)
 {
-    InterlockedExchange64((volatile LONG64 *)Counter, (LONG64)Value);
+#if defined(_M_ARM64)
+    __stlr32((volatile unsigned __int32 *)Pointer, Value);
+#else
+    InterlockedExchange((volatile LONG *)Pointer, (LONG)Value);
+#endif
 }
 
 #if !defined(WINSPD_SYS_INTERNAL)
