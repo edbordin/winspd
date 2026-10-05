@@ -397,12 +397,13 @@ exit:;
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 }
 
-static VOID SpdIoctlRingWait(SPD_DEVICE_EXTENSION *DeviceExtension,
+static SPD_SERVICE_IRP_DISPOSITION SpdIoctlRingWait(SPD_DEVICE_EXTENSION *DeviceExtension,
     ULONG InputBufferLength, ULONG OutputBufferLength,
     SPD_IOCTL_RING_WAIT_PARAMS *Params, PIRP Irp)
 {
     SPD_STORAGE_UNIT *StorageUnit = 0;
     ULONG ProcessId = IoGetRequestorProcessId(Irp);
+    SPD_SERVICE_IRP_DISPOSITION Disposition = SpdServiceIrpCompleteNow;
 
     if (sizeof *Params > InputBufferLength ||
         sizeof *Params > OutputBufferLength)
@@ -418,14 +419,20 @@ static VOID SpdIoctlRingWait(SPD_DEVICE_EXTENSION *DeviceExtension,
         goto exit;
     }
 
-    Irp->IoStatus.Status = SpdStorageUnitRingWait(StorageUnit,
+    Disposition = SpdStorageUnitRingWait(StorageUnit,
         ProcessId, Params, Irp);
-    if (NT_SUCCESS(Irp->IoStatus.Status))
-        Irp->IoStatus.Information = sizeof *Params;
+    if (SpdServiceIrpDeferred == Disposition)
+    {
+        /* The retained wait owns this reference until it completes. */
+        StorageUnit = 0;
+        goto exit;
+    }
 
 exit:;
     if (0 != StorageUnit)
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+
+    return Disposition;
 }
 
 static VOID SpdIoctlRingKick(SPD_DEVICE_EXTENSION *DeviceExtension,
@@ -469,6 +476,7 @@ VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
     ULONG InputBufferLength = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
     ULONG OutputBufferLength = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
     PVOID Params = Irp->AssociatedIrp.SystemBuffer;
+    BOOLEAN CompleteServiceIrp = TRUE;
 
     if (0 == Params ||
         sizeof(SPD_IOCTL_BASE_PARAMS) > InputBufferLength ||
@@ -505,7 +513,9 @@ VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
         SpdIoctlRingStop(DeviceExtension, InputBufferLength, Params, Irp);
         break;
     case SPD_IOCTL_RING_WAIT:
-        SpdIoctlRingWait(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
+        if (SpdServiceIrpDeferred == SpdIoctlRingWait(DeviceExtension,
+            InputBufferLength, OutputBufferLength, Params, Irp))
+            CompleteServiceIrp = FALSE;
         break;
     case SPD_IOCTL_RING_KICK:
         SpdIoctlRingKick(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
@@ -516,10 +526,13 @@ VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
     }
 
 exit:
-    if (STATUS_SUCCESS != Irp->IoStatus.Status &&
-        STATUS_BUFFER_OVERFLOW != Irp->IoStatus.Status)
-        Irp->IoStatus.Information = 0;
-    StorPortCompleteServiceIrp(DeviceExtension, Irp);
+    if (CompleteServiceIrp)
+    {
+        if (STATUS_SUCCESS != Irp->IoStatus.Status &&
+            STATUS_BUFFER_OVERFLOW != Irp->IoStatus.Status)
+            Irp->IoStatus.Information = 0;
+        StorPortCompleteServiceIrp(DeviceExtension, Irp);
+    }
 
     SPD_LEAVE(ioctl,
         "%p, Irp=%p", "",
@@ -540,8 +553,7 @@ VOID SpdHwCompleteServiceIrp(PVOID DeviceExtension0)
         if (0 == StorageUnit)
             continue;
 
-        /* stop the unit's Ioq; this will cause all pending service IRP's to be cancelled */
-        SpdIoqReset(StorageUnit->Ioq, TRUE);
+        SpdStorageUnitRingStopForRemoval(StorageUnit);
 
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
     }

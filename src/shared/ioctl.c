@@ -434,12 +434,9 @@ DWORD SpdIoctlTransact(HANDLE DeviceHandle,
      * DeviceIoControl with a NULL Overlapped parameter, which the MSDN
      * explicitly warns against. Why do we do this and why does it work?
      *
-     * The reason that this works despite MSDN warnings is that we know
-     * that our kernel driver handles IOCTL_MINIPORT_PROCESS_SERVICE_IRP
-     * in a *synchronous* manner and never returns STATUS_PENDING for it.
-     * This means that the OVERLAPPED structure special processing never
-     * comes into play for our DeviceIoControl calls and it is safe to
-     * call DeviceIoControl without an Overlapped structure.
+     * The legacy SPD_IOCTL_TRANSACT path is completed synchronously by the
+     * miniport. RING_WAIT is intentionally deferred; SpdIoctlRingWait uses
+     * an OVERLAPPED event and waits for that completion explicitly.
      *
      * The next obvious question: what is the beneft of FILE_FLAG_OVERLAPPED
      * then? To answer this consider that Windows serializes all calls for
@@ -581,18 +578,34 @@ DWORD SpdIoctlRingWait(HANDLE DeviceHandle,
 {
     DWORD BytesTransferred;
     DWORD Error;
+    OVERLAPPED Overlapped;
+    HANDLE Event;
 
     Params->Base.Size = sizeof *Params;
     Params->Base.Code = SPD_IOCTL_RING_WAIT;
     Params->Btl = Btl;
 
+    memset(&Overlapped, 0, sizeof Overlapped);
+    Event = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == Event)
+        return GetLastError();
+    Overlapped.hEvent = Event;
+
     if (!DeviceIoControl(DeviceHandle, IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
         Params, sizeof *Params,
         Params, sizeof *Params,
-        &BytesTransferred, 0))
+        &BytesTransferred, &Overlapped))
     {
         Error = GetLastError();
-        goto exit;
+        if (ERROR_IO_PENDING != Error)
+            goto exit;
+
+        if (!GetOverlappedResult(DeviceHandle, &Overlapped,
+            &BytesTransferred, TRUE))
+        {
+            Error = GetLastError();
+            goto exit;
+        }
     }
 
     if (sizeof *Params != BytesTransferred)
@@ -604,6 +617,7 @@ DWORD SpdIoctlRingWait(HANDLE DeviceHandle,
     Error = ERROR_SUCCESS;
 
 exit:
+    CloseHandle(Event);
     return Error;
 }
 

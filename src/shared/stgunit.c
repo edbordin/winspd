@@ -125,6 +125,7 @@ struct _SPD_RING_RUNTIME
     UINT64 SubmittedRequests;
     UINT32 MaxSubmissionBatch;
     UINT64 CompletionBatches;
+    UINT64 QueuedResponses;
     UINT64 CompletedRequests;
     UINT32 MaxCompletionBatch;
 };
@@ -771,6 +772,7 @@ static BOOLEAN SpdRingQueueDoneLocked(
     SPD_RING_USER_ITEM *Item)
 {
     SpdRingListInsertTail(&Runtime->DoneQueue, &Item->QueueLink);
+    Runtime->QueuedResponses++;
     if (!Runtime->DoneNotificationPending)
     {
         Runtime->DoneNotificationPending = TRUE;
@@ -804,7 +806,10 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         SPD_RING_USER_ITEM *Item;
         SPD_IOCTL_TRANSACT_RSP Response;
         SPD_STORAGE_UNIT_OPERATION_CONTEXT OperationContext;
+        UINT64 ResponseHint;
+        UINT64 QueuedResponses = 0;
         BOOLEAN Complete;
+        BOOLEAN ResponseQueued = FALSE;
         BOOLEAN ProtocolError = FALSE;
         BOOLEAN NotifyError = FALSE;
 
@@ -835,6 +840,7 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         Item->SendResponseActive = FALSE;
         Item->CallbackFinished = FALSE;
         Item->CallbackComplete = FALSE;
+        ResponseHint = Item->Message.Request.Hint;
         ReleaseSRWLockExclusive(&Runtime->CompletionLock);
 
         if (StorageUnit->DebugLog &&
@@ -867,6 +873,8 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
                 SpdRingActiveRemoveLocked(Item);
                 Item->State = SpdRingUserItemDoneQueued;
                 NotifyError = !SpdRingQueueDoneLocked(Runtime, Item);
+                ResponseQueued = TRUE;
+                QueuedResponses = Runtime->QueuedResponses;
             }
         }
         else if (Item->EarlyResponseValid)
@@ -876,10 +884,17 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
             SpdRingActiveRemoveLocked(Item);
             Item->State = SpdRingUserItemDoneQueued;
             NotifyError = !SpdRingQueueDoneLocked(Runtime, Item);
+            ResponseQueued = TRUE;
+            QueuedResponses = Runtime->QueuedResponses;
         }
         else
             Item->State = SpdRingUserItemDeferred;
         ReleaseSRWLockExclusive(&Runtime->CompletionLock);
+
+        if (ResponseQueued)
+            SpdDebugLog("SharedRing response queued tick=%I64u hint=%I64u "
+                "count=%I64u\n", GetTickCount64(), ResponseHint,
+                QueuedResponses);
 
         if (ProtocolError || NotifyError)
         {
@@ -1107,6 +1122,9 @@ static VOID SpdRingPublishCompletions(
 
     Runtime->CompletionTail = Tail;
     SpdRingStoreRelease32(&Header->CompletionTail.Value, Tail);
+    SpdDebugLog("SharedRing completions published tick=%I64u count=%lu "
+        "tail=%lu\n", GetTickCount64(), (unsigned long)Published,
+        (unsigned long)Tail);
     Runtime->CompletionBatches++;
     Runtime->CompletedRequests += Published;
     if (Published > Runtime->MaxCompletionBatch)
@@ -1165,6 +1183,13 @@ static VOID SpdRingHandleKickCompletion(
     DWORD Error)
 {
     Runtime->KickOutstanding = FALSE;
+    SpdDebugLog("SharedRing KICK completed tick=%I64u error=%lu "
+        "consumed=%lu head=%lu tail=%lu\n", GetTickCount64(),
+        (unsigned long)Error,
+        (unsigned long)Runtime->KickParams.Consumed,
+        (unsigned long)SpdRingLoadAcquire32(
+            &Runtime->Header->CompletionHead.Value),
+        (unsigned long)Runtime->CompletionTail);
     if (InterlockedCompareExchange(&Runtime->Stopping, 0, 0) &&
         ERROR_OPERATION_ABORTED == Error)
         return;
@@ -1282,11 +1307,13 @@ static DWORD WINAPI SpdStorageUnitRingPumpThread(PVOID Runtime0)
         (volatile LONG *)&Runtime->Error, 0, 0);
     SpdStorageUnitSetDispatcherError(StorageUnit, Runtime->Error);
     SpdDebugLog("SharedRing batches submissions=%I64u requests=%I64u "
-        "max=%lu completions=%I64u responses=%I64u max=%lu "
+        "max=%lu completions=%I64u responses_queued=%I64u "
+        "responses_published=%I64u max=%lu "
         "workers=%lu depth=%lu buffer_size=%lu error=%lu\n",
         Runtime->SubmissionBatches, Runtime->SubmittedRequests,
         (unsigned long)Runtime->MaxSubmissionBatch,
-        Runtime->CompletionBatches, Runtime->CompletedRequests,
+        Runtime->CompletionBatches, Runtime->QueuedResponses,
+        Runtime->CompletedRequests,
         (unsigned long)Runtime->MaxCompletionBatch,
         (unsigned long)Runtime->WorkerCount,
         (unsigned long)Runtime->QueueDepth,

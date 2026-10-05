@@ -179,6 +179,63 @@ NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
 
+    if (NT_SUCCESS(Result))
+    {
+        SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
+        SpdStorageUnitRingNotifyRequest(SrbExtension->StorageUnit);
+    }
+
+    return Result;
+}
+
+NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
+    VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
+    PVOID Context, PVOID DataBuffer)
+{
+    NTSTATUS Result;
+    KIRQL Irql;
+
+    ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
+
+    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+
+    if (Ioq->Stopped)
+    {
+        SpdQeventSetNoLock(&Ioq->PendingEvent);
+        Result = STATUS_CANCELLED;
+    }
+    else if (IsListEmpty(&Ioq->PendingList))
+        Result = STATUS_NOT_FOUND;
+    else
+    {
+        PLIST_ENTRY PendingEntry = Ioq->PendingList.Flink;
+        SPD_SRB_EXTENSION *SrbExtension =
+            CONTAINING_RECORD(PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+        BOOLEAN Wake;
+        ULONG Index;
+
+        Wake = !RemoveEntryList(&SrbExtension->ListEntry);
+
+        Prepare(SrbExtension, Context, DataBuffer);
+
+        InsertTailList(&Ioq->ProcessList, &SrbExtension->ListEntry);
+        Index = SpdHashMixPointer(SrbExtension) % Ioq->ProcessBucketCount;
+#if DBG
+        for (PVOID X = Ioq->ProcessBuckets[Index]; X; X = ((SPD_SRB_EXTENSION *)X)->HashNext)
+            ASSERT(X != SrbExtension);
+        ASSERT(0 == SrbExtension->HashNext);
+#endif
+        SrbExtension->HashNext = Ioq->ProcessBuckets[Index];
+        Ioq->ProcessBuckets[Index] = SrbExtension;
+
+        if (Wake)
+            SpdQeventSetNoLock(&Ioq->PendingEvent);
+
+        Result = STATUS_SUCCESS;
+    }
+
+    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+
     return Result;
 }
 
