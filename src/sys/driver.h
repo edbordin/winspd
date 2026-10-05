@@ -341,10 +341,10 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
 NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP CancellableIrp,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
-VOID SpdIoqEndProcessingSrb(SPD_IOQ *Ioq, UINT64 Hint,
+NTSTATUS SpdIoqEndProcessingSrb(SPD_IOQ *Ioq, UINT64 Hint,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
-VOID SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
     PVOID SrbExtension,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);

@@ -990,8 +990,14 @@ NTSTATUS SpdStorageUnitRingKick(
         }
 
         /* Hint remains the opaque canonical IOQ correlation value. */
-        SpdIoqEndProcessingSrb(StorageUnit->Ioq, Response->Hint,
-            SpdSrbExecuteScsiComplete, Response, DataBuffer);
+        Result = SpdIoqEndProcessingSrb(StorageUnit->Ioq,
+            Response->Hint, SpdSrbExecuteScsiComplete,
+            Response, DataBuffer);
+        if (!NT_SUCCESS(Result))
+        {
+            Failed = TRUE;
+            break;
+        }
 
         if (SPD_RING_NO_BUFFER != BufferId)
         {

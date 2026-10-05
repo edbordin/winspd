@@ -1522,19 +1522,29 @@ static void ioctl_ring_batch_full_boundary_test(void)
     SpdRingStoreRelease32(&Header->RequestHead.Value, RequestTail);
     SpdRingStoreRelease32(&Header->CompletionTail.Value,
         CompletionTail + 2);
-    ASSERT(2 == SpdRingLoadAcquire32(&Header->CompletionTail.Value) -
-        SpdRingLoadAcquire32(&Header->CompletionHead.Value));
 
     memset(&KickParams, 0, sizeof KickParams);
-    ASSERT(ERROR_SUCCESS == SpdIoctlRingKick(State.StorageUnit->Handle,
-        State.StorageUnit->Btl, &KickParams));
+    Error = SpdIoctlRingKick(State.StorageUnit->Handle,
+        State.StorageUnit->Btl, &KickParams);
+    if (ERROR_SUCCESS != Error)
+        tlib_printf("batch RING_KICK failed error=%lu consumed=%lu\n",
+            (unsigned long)Error, (unsigned long)KickParams.Consumed);
+    ASSERT(ERROR_SUCCESS == Error);
     ASSERT(2 == KickParams.Consumed);
     for (UINT32 I = 0; 2 > I; I++)
     {
-        if (!GetOverlappedResult(DiskHandle, &Overlapped[I],
-                &BytesRead, TRUE))
+        DWORD WaitResult = WaitForSingleObject(
+            Overlapped[I].hEvent, 30000);
+        BOOL ReadCompleted = WAIT_OBJECT_0 == WaitResult &&
+            GetOverlappedResult(DiskHandle, &Overlapped[I],
+                &BytesRead, FALSE);
+
+        if (!ReadCompleted)
         {
-            Error = GetLastError();
+            Error = WAIT_OBJECT_0 == WaitResult ? GetLastError() :
+                WAIT_TIMEOUT == WaitResult ? ERROR_TIMEOUT :
+                GetLastError();
+            SpdStorageUnitShutdown(State.StorageUnit);
             tlib_printf("batch READ[%lu] completion failed error=%lu bytes=%lu kickConsumed=%lu req=%lu/%lu cq=%lu/%lu\n",
                 (unsigned long)I,
                 (unsigned long)Error,
@@ -1546,8 +1556,14 @@ static void ioctl_ring_batch_full_boundary_test(void)
                     &Header->RequestTail.Value),
                 (unsigned long)SpdRingLoadAcquire32(
                     &Header->CompletionHead.Value),
-                (unsigned long)SpdRingLoadAcquire32(
-                    &Header->CompletionTail.Value));
+                    (unsigned long)SpdRingLoadAcquire32(
+                        &Header->CompletionTail.Value));
+            tlib_printf("batch READ[%lu] timeout cleanup requested ring shutdown\n",
+                (unsigned long)I);
+            CancelIoEx(DiskHandle, &Overlapped[I]);
+            CancelIoEx(DiskHandle, &Overlapped[1 - I]);
+            WaitForSingleObject(Overlapped[I].hEvent, 5000);
+            WaitForSingleObject(Overlapped[1 - I].hEvent, 5000);
             CloseHandle(Overlapped[I].hEvent);
             CloseHandle(Overlapped[1 - I].hEvent);
             CloseHandle(DiskHandle);

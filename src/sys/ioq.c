@@ -303,11 +303,12 @@ NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP Can
     return Result;
 }
 
-VOID SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
+NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
     PVOID SrbExtension0,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer)
 {
+    NTSTATUS Result;
     KIRQL Irql;
 
     KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
@@ -316,6 +317,7 @@ VOID SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
     {
         SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
         ULONG Index;
+        Result = STATUS_NOT_FOUND;
 
         Index = SpdHashMixPointer(SrbExtension) % Ioq->ProcessBucketCount;
         for (PVOID *P = &Ioq->ProcessBuckets[Index]; *P; P = &((SPD_SRB_EXTENSION *)(*P))->HashNext)
@@ -345,17 +347,22 @@ VOID SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
                 else
                     SpdSrbComplete(Ioq->DeviceExtension, SrbExtension->Srb, SrbStatus);
 
+                Result = STATUS_SUCCESS;
                 break;
             }
     }
+    else
+        Result = STATUS_CANCELLED;
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+
+    return Result;
 }
 
-VOID SpdIoqEndProcessingSrb(SPD_IOQ *Ioq, UINT64 Hint,
+NTSTATUS SpdIoqEndProcessingSrb(SPD_IOQ *Ioq, UINT64 Hint,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer)
 {
-    SpdIoqEndProcessingSrbByExtension(Ioq, (PVOID)(UINT_PTR)Hint,
+    return SpdIoqEndProcessingSrbByExtension(Ioq, (PVOID)(UINT_PTR)Hint,
         Complete, Context, DataBuffer);
 }
