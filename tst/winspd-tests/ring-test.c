@@ -1405,11 +1405,20 @@ static void ioctl_ring_batch_full_boundary_test(void)
     UINT32 BufferIds[2];
 
     ring_test_create(&State, &RingTestGuidBatch, 2);
+    tlib_printf("batch stage: manual discovery begin\n");
+    fflush(stdout);
     ring_test_wait_for_disk_manual(&State);
+    tlib_printf("batch stage: manual discovery complete path=%ls\n",
+        State.DiskPath);
+    fflush(stdout);
+    tlib_printf("batch stage: disk open begin\n");
+    fflush(stdout);
     DiskHandle = CreateFileW(State.DiskPath, GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
     ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    tlib_printf("batch stage: disk open complete\n");
+    fflush(stdout);
     memset(Overlapped, 0, sizeof Overlapped);
     for (UINT32 I = 0; ARRAYSIZE(Overlapped) > I; I++)
     {
@@ -1425,8 +1434,13 @@ static void ioctl_ring_batch_full_boundary_test(void)
             Error = ERROR_SUCCESS;
         else
             Error = GetLastError();
+        tlib_printf("batch stage: READ[%lu] submit result=%lu\n",
+            (unsigned long)I, (unsigned long)Error);
+        fflush(stdout);
         ASSERT(ERROR_IO_PENDING == Error);
     }
+    tlib_printf("batch stage: reads submitted\n");
+    fflush(stdout);
 
     Header = State.StorageUnit->SharedRingHeader;
     RequestRing = (SPD_RING_REQUEST *)
@@ -1522,6 +1536,23 @@ static void ioctl_ring_batch_full_boundary_test(void)
     SpdRingStoreRelease32(&Header->RequestHead.Value, RequestTail);
     SpdRingStoreRelease32(&Header->CompletionTail.Value,
         CompletionTail + 2);
+
+    /*
+     * If Storport has already aborted either SRB, its overlapped read will
+     * have completed before RING_KICK. Capture that distinction before a
+     * failed kick resets the IOQ and completes any still-pending reads.
+     */
+    for (UINT32 I = 0; ARRAYSIZE(Overlapped) > I; I++)
+    {
+        DWORD PendingBytes = 0;
+        if (GetOverlappedResult(DiskHandle, &Overlapped[I],
+                &PendingBytes, FALSE))
+            tlib_printf("batch READ[%lu] completed before kick bytes=%lu\n",
+                (unsigned long)I, (unsigned long)PendingBytes);
+        else
+            tlib_printf("batch READ[%lu] pre-kick status error=%lu\n",
+                (unsigned long)I, (unsigned long)GetLastError());
+    }
 
     memset(&KickParams, 0, sizeof KickParams);
     Error = SpdIoctlRingKick(State.StorageUnit->Handle,
