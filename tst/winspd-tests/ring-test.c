@@ -20,6 +20,11 @@ typedef struct _RING_TEST_STATE
     SPD_STORAGE_UNIT *StorageUnit;
     GUID Guid;
     WCHAR DiskPath[1024];
+    HANDLE ManualDiskHandle;
+    HANDLE ManualWaitEvent;
+    OVERLAPPED ManualWaitOverlapped;
+    SPD_IOCTL_RING_WAIT_PARAMS ManualWaitParams;
+    BOOLEAN ManualWaitOutstanding;
     HANDLE ReleaseReads;
     HANDLE TwoReadsStarted;
     HANDLE ReleaseSlowRead;
@@ -60,6 +65,15 @@ typedef struct _RING_TEST_READ_THREAD
     DWORD Error;
 } RING_TEST_READ_THREAD;
 
+typedef struct _RING_TEST_OPEN_THREAD
+{
+    RING_TEST_STATE *State;
+    HANDLE Finished;
+    DWORD DesiredAccess;
+    HANDLE DiskHandle;
+    DWORD Error;
+} RING_TEST_OPEN_THREAD;
+
 enum
 {
     RingTestAsyncNone,
@@ -80,159 +94,177 @@ enum
     RingTestWaitTimeoutMs = 15000
 };
 
+static DWORD ring_test_begin_wait(
+    RING_TEST_STATE *State,
+    UINT32 MaxRequests)
+{
+    DWORD BytesTransferred = 0;
+    DWORD Error;
+    BOOL Success;
+
+    if (State->ManualWaitOutstanding)
+        return ERROR_SUCCESS;
+
+    memset(&State->ManualWaitParams, 0,
+        sizeof State->ManualWaitParams);
+    State->ManualWaitParams.Base.Size =
+        sizeof State->ManualWaitParams;
+    State->ManualWaitParams.Base.Code = SPD_IOCTL_RING_WAIT;
+    State->ManualWaitParams.Btl = State->StorageUnit->Btl;
+    State->ManualWaitParams.MaxRequests = MaxRequests;
+
+    memset(&State->ManualWaitOverlapped, 0,
+        sizeof State->ManualWaitOverlapped);
+    State->ManualWaitEvent = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == State->ManualWaitEvent)
+        return GetLastError();
+    State->ManualWaitOverlapped.hEvent = State->ManualWaitEvent;
+
+    Success = DeviceIoControl(
+        State->StorageUnit->Handle,
+        IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+        &State->ManualWaitParams,
+        sizeof State->ManualWaitParams,
+        &State->ManualWaitParams,
+        sizeof State->ManualWaitParams,
+        &BytesTransferred,
+        &State->ManualWaitOverlapped);
+    if (!Success && ERROR_IO_PENDING != (Error = GetLastError()))
+    {
+        CloseHandle(State->ManualWaitEvent);
+        State->ManualWaitEvent = 0;
+        return Error;
+    }
+
+    State->ManualWaitOutstanding = TRUE;
+    return ERROR_SUCCESS;
+}
+
+static DWORD ring_test_stop_pending_wait(RING_TEST_STATE *State)
+{
+    SPD_IOCTL_RING_CLOSE_PARAMS StopParams;
+    DWORD StopBytes = 0;
+    DWORD StopError;
+    OVERLAPPED StopOverlapped;
+    HANDLE StopEvent;
+
+    memset(&StopParams, 0, sizeof StopParams);
+    StopParams.Base.Size = sizeof StopParams;
+    StopParams.Base.Code = SPD_IOCTL_RING_STOP;
+    StopParams.Btl = State->StorageUnit->Btl;
+    memset(&StopOverlapped, 0, sizeof StopOverlapped);
+    StopEvent = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == StopEvent)
+        StopError = GetLastError();
+    else
+    {
+        StopOverlapped.hEvent = StopEvent;
+        if (!DeviceIoControl(State->StorageUnit->Handle,
+                IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
+                &StopParams, sizeof StopParams, 0, 0,
+                &StopBytes, &StopOverlapped))
+        {
+            StopError = GetLastError();
+            if (ERROR_IO_PENDING == StopError)
+            {
+                DWORD StopWait = WaitForSingleObject(
+                    StopEvent, INFINITE);
+                if (WAIT_OBJECT_0 == StopWait &&
+                    GetOverlappedResult(State->StorageUnit->Handle,
+                        &StopOverlapped, &StopBytes, FALSE))
+                    StopError = ERROR_SUCCESS;
+                else
+                    StopError = WAIT_FAILED == StopWait ?
+                        GetLastError() : ERROR_GEN_FAILURE;
+            }
+        }
+        else
+            StopError = ERROR_SUCCESS;
+    }
+    if (ERROR_SUCCESS != StopError)
+    {
+        tlib_printf("manual RING_WAIT timeout: RING_STOP failed error=%lu\n",
+            (unsigned long)StopError);
+        CancelIoEx(State->StorageUnit->Handle,
+            &State->ManualWaitOverlapped);
+    }
+    if (0 != StopEvent)
+        CloseHandle(StopEvent);
+
+    /* Keep the state-owned OVERLAPPED and buffer alive until the IRP exits. */
+    if (!GetOverlappedResult(State->StorageUnit->Handle,
+            &State->ManualWaitOverlapped, &StopBytes, TRUE))
+        tlib_printf("manual RING_WAIT stopped with error=%lu\n",
+            (unsigned long)GetLastError());
+
+    CloseHandle(State->ManualWaitEvent);
+    State->ManualWaitEvent = 0;
+    State->ManualWaitOutstanding = FALSE;
+    return WAIT_TIMEOUT;
+}
+
+static DWORD ring_test_finish_wait(
+    RING_TEST_STATE *State,
+    SPD_IOCTL_RING_WAIT_PARAMS *Params,
+    DWORD TimeoutMs)
+{
+    SPD_RING_HEADER *Header = State->StorageUnit->SharedRingHeader;
+    DWORD BytesTransferred = 0;
+    DWORD Error;
+    DWORD WaitResult;
+
+    if (!State->ManualWaitOutstanding)
+        return ERROR_INVALID_STATE;
+
+    WaitResult = WaitForSingleObject(State->ManualWaitEvent, TimeoutMs);
+    if (WAIT_OBJECT_0 != WaitResult)
+    {
+        if (0 != Header)
+            tlib_printf("manual RING_WAIT timed out: req=%lu/%lu cq=%lu/%lu max=%lu\n",
+                (unsigned long)SpdRingLoadAcquire32(
+                    &Header->RequestHead.Value),
+                (unsigned long)SpdRingLoadAcquire32(
+                    &Header->RequestTail.Value),
+                (unsigned long)SpdRingLoadAcquire32(
+                    &Header->CompletionHead.Value),
+                (unsigned long)SpdRingLoadAcquire32(
+                    &Header->CompletionTail.Value),
+                (unsigned long)State->ManualWaitParams.MaxRequests);
+        return ring_test_stop_pending_wait(State);
+    }
+
+    if (!GetOverlappedResult(State->StorageUnit->Handle,
+            &State->ManualWaitOverlapped, &BytesTransferred, FALSE))
+        Error = GetLastError();
+    else if (sizeof State->ManualWaitParams != BytesTransferred)
+        Error = ERROR_INVALID_DATA;
+    else
+    {
+        *Params = State->ManualWaitParams;
+        Error = ERROR_SUCCESS;
+    }
+
+    CloseHandle(State->ManualWaitEvent);
+    State->ManualWaitEvent = 0;
+    State->ManualWaitOutstanding = FALSE;
+    return Error;
+}
+
 static DWORD ring_test_wait(
     RING_TEST_STATE *State,
     SPD_IOCTL_RING_WAIT_PARAMS *Params,
     DWORD TimeoutMs)
 {
-    OVERLAPPED Overlapped;
-    DWORD BytesTransferred = 0;
     DWORD Error;
-    HANDLE Event;
-    BOOL Success;
-    DWORD WaitResult;
 
-    Params->Base.Size = sizeof *Params;
-    Params->Base.Code = SPD_IOCTL_RING_WAIT;
-    Params->Btl = State->StorageUnit->Btl;
-
-    memset(&Overlapped, 0, sizeof Overlapped);
-    Event = CreateEventW(0, TRUE, FALSE, 0);
-    if (0 == Event)
-        return GetLastError();
-    Overlapped.hEvent = Event;
-
-    Success = DeviceIoControl(
-        State->StorageUnit->Handle,
-        IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
-        Params,
-        sizeof *Params,
-        Params,
-        sizeof *Params,
-        &BytesTransferred,
-        &Overlapped);
-    if (!Success)
+    if (!State->ManualWaitOutstanding)
     {
-        Error = GetLastError();
-        if (ERROR_IO_PENDING != Error)
-        {
-            CloseHandle(Event);
+        Error = ring_test_begin_wait(State, Params->MaxRequests);
+        if (ERROR_SUCCESS != Error)
             return Error;
-        }
-
-        WaitResult = WaitForSingleObject(Event, TimeoutMs);
-        if (WAIT_OBJECT_0 != WaitResult)
-        {
-            SPD_RING_HEADER *Header =
-                State->StorageUnit->SharedRingHeader;
-            SPD_IOCTL_RING_CLOSE_PARAMS StopParams;
-            DWORD StopBytes = 0;
-            DWORD StopError;
-            OVERLAPPED StopOverlapped;
-            HANDLE StopEvent;
-
-            if (0 != Header)
-            {
-                tlib_printf("manual RING_WAIT timed out: req=%lu/%lu cq=%lu/%lu max=%lu\n",
-                    (unsigned long)SpdRingLoadAcquire32(
-                        &Header->RequestHead.Value),
-                    (unsigned long)SpdRingLoadAcquire32(
-                        &Header->RequestTail.Value),
-                    (unsigned long)SpdRingLoadAcquire32(
-                        &Header->CompletionHead.Value),
-                    (unsigned long)SpdRingLoadAcquire32(
-                        &Header->CompletionTail.Value),
-                    (unsigned long)Params->MaxRequests);
-            }
-
-            /*
-             * A timed-out wait owns a live service IRP. Stop the ring to
-             * detach and complete it before its OVERLAPPED and output buffer
-             * go out of scope.
-             */
-            memset(&StopParams, 0, sizeof StopParams);
-            StopParams.Base.Size = sizeof StopParams;
-            StopParams.Base.Code = SPD_IOCTL_RING_STOP;
-            StopParams.Btl = State->StorageUnit->Btl;
-            memset(&StopOverlapped, 0, sizeof StopOverlapped);
-            StopEvent = CreateEventW(0, TRUE, FALSE, 0);
-            if (0 == StopEvent)
-            {
-                StopError = GetLastError();
-            }
-            else
-            {
-                StopOverlapped.hEvent = StopEvent;
-                if (!DeviceIoControl(
-                State->StorageUnit->Handle,
-                IOCTL_MINIPORT_PROCESS_SERVICE_IRP,
-                &StopParams,
-                sizeof StopParams,
-                0,
-                0,
-                &StopBytes,
-                &StopOverlapped))
-                {
-                    StopError = GetLastError();
-                    if (ERROR_IO_PENDING == StopError)
-                    {
-                        DWORD StopWait = WaitForSingleObject(
-                            StopEvent, INFINITE);
-                        if (WAIT_OBJECT_0 == StopWait &&
-                            GetOverlappedResult(
-                                State->StorageUnit->Handle,
-                                &StopOverlapped,
-                                &StopBytes,
-                                FALSE))
-                            StopError = ERROR_SUCCESS;
-                        else
-                            StopError = WAIT_FAILED == StopWait ?
-                                GetLastError() : ERROR_GEN_FAILURE;
-                    }
-                }
-                else
-                    StopError = ERROR_SUCCESS;
-            }
-            if (ERROR_SUCCESS != StopError)
-            {
-                tlib_printf("manual RING_WAIT timeout: RING_STOP failed error=%lu\n",
-                    (unsigned long)StopError);
-                CancelIoEx(
-                    State->StorageUnit->Handle,
-                    &Overlapped);
-            }
-            if (0 != StopEvent)
-                CloseHandle(StopEvent);
-
-            if (!GetOverlappedResult(
-                    State->StorageUnit->Handle,
-                    &Overlapped,
-                    &BytesTransferred,
-                    TRUE))
-            {
-                tlib_printf("manual RING_WAIT stopped with error=%lu\n",
-                    (unsigned long)GetLastError());
-            }
-
-            CloseHandle(Event);
-            return WAIT_TIMEOUT;
-        }
-
-        if (!GetOverlappedResult(
-                State->StorageUnit->Handle,
-                &Overlapped,
-                &BytesTransferred,
-                FALSE))
-        {
-            Error = GetLastError();
-            CloseHandle(Event);
-            return Error;
-        }
     }
 
-    CloseHandle(Event);
-    return sizeof *Params == BytesTransferred ?
-        ERROR_SUCCESS : ERROR_INVALID_DATA;
+    return ring_test_finish_wait(State, Params, TimeoutMs);
 }
 
 static BOOL ring_test_disk_has_serial(RING_TEST_STATE *State, DWORD Drive,
@@ -540,9 +572,16 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
     }
     if (State->SlowReadBlockAddress == BlockAddress)
     {
+        tlib_printf("out-of-order slow callback entered block=%I64u\n",
+            BlockAddress);
+        fflush(stdout);
         SetEvent(State->SlowReadStarted);
-        if (WAIT_OBJECT_0 != WaitForSingleObject(
-                State->ReleaseSlowRead, 10000))
+        DWORD SlowGateResult = WaitForSingleObject(
+            State->ReleaseSlowRead, 10000);
+        tlib_printf("out-of-order slow callback gate result=%lu block=%I64u\n",
+            (unsigned long)SlowGateResult, BlockAddress);
+        fflush(stdout);
+        if (WAIT_OBJECT_0 != SlowGateResult)
         {
             InterlockedExchange(&State->Failure, 1);
             return TRUE;
@@ -630,7 +669,8 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
                 InterlockedExchange(&State->Failure, 1);
             CloseHandle(SentEvent);
         }
-        return RingTestAsyncEarlyTrue != AsyncMode;
+        /* Only the explicit negative-test mode returns synchronous TRUE. */
+        return RingTestAsyncEarlyTrue == AsyncMode;
     }
 
     return TRUE;
@@ -788,6 +828,16 @@ static VOID ring_test_destroy(RING_TEST_STATE *State)
     {
         SetEvent(State->ReleaseReads);
         ring_test_join_async_threads(State);
+        if (State->ManualWaitOutstanding)
+        {
+            SPD_IOCTL_RING_WAIT_PARAMS UnusedParams;
+            (void)ring_test_finish_wait(State, &UnusedParams, 0);
+        }
+        if (0 != State->ManualDiskHandle)
+        {
+            CloseHandle(State->ManualDiskHandle);
+            State->ManualDiskHandle = 0;
+        }
         SpdStorageUnitShutdown(State->StorageUnit);
         SpdStorageUnitWaitDispatcher(State->StorageUnit);
         SpdStorageUnitGetDispatcherError(State->StorageUnit,
@@ -818,16 +868,56 @@ static DWORD ring_test_disk_read_at(
     UINT8 DataBuffer[RingTestDataLength];
     DWORD BytesRead;
     HANDLE DiskHandle;
+    BOOLEAN OwnHandle = FALSE;
     DWORD Error;
 
-    DiskHandle = CreateFileW(State->DiskPath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL, 0);
-    if (INVALID_HANDLE_VALUE == DiskHandle)
-        return GetLastError();
-
     Offset.QuadPart = (LONGLONG)BlockAddress * RingTestDataLength;
-    if (!SetFilePointerEx(DiskHandle, Offset, 0, FILE_BEGIN))
+    DiskHandle = State->ManualDiskHandle;
+    if (0 == DiskHandle)
+    {
+        DiskHandle = CreateFileW(State->DiskPath, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL, 0);
+        if (INVALID_HANDLE_VALUE == DiskHandle)
+            return GetLastError();
+        OwnHandle = TRUE;
+    }
+
+    if (!OwnHandle)
+    {
+        OVERLAPPED Overlapped;
+        DWORD WaitResult;
+
+        memset(&Overlapped, 0, sizeof Overlapped);
+        Overlapped.hEvent = CreateEventW(0, TRUE, FALSE, 0);
+        if (0 == Overlapped.hEvent)
+            Error = GetLastError();
+        else
+        {
+            Overlapped.Offset = Offset.LowPart;
+            Overlapped.OffsetHigh = Offset.HighPart;
+            if (ReadFile(DiskHandle, DataBuffer, sizeof DataBuffer,
+                    &BytesRead, &Overlapped))
+                Error = ERROR_SUCCESS;
+            else if (ERROR_IO_PENDING != (Error = GetLastError()))
+                ;
+            else
+            {
+                WaitResult = WaitForSingleObject(
+                    Overlapped.hEvent, INFINITE);
+                if (WAIT_OBJECT_0 != WaitResult)
+                    Error = WAIT_FAILED == WaitResult ?
+                        GetLastError() : ERROR_GEN_FAILURE;
+                else if (!GetOverlappedResult(DiskHandle,
+                        &Overlapped, &BytesRead, FALSE))
+                    Error = GetLastError();
+                else
+                    Error = ERROR_SUCCESS;
+            }
+            CloseHandle(Overlapped.hEvent);
+        }
+    }
+    else if (!SetFilePointerEx(DiskHandle, Offset, 0, FILE_BEGIN))
         Error = GetLastError();
     else if (!ReadFile(DiskHandle, DataBuffer, sizeof DataBuffer,
         &BytesRead, 0))
@@ -835,6 +925,8 @@ static DWORD ring_test_disk_read_at(
     else
         Error = sizeof DataBuffer == BytesRead ? ERROR_SUCCESS :
             ERROR_INVALID_DATA;
+    if (ERROR_SUCCESS == Error && sizeof DataBuffer != BytesRead)
+        Error = ERROR_INVALID_DATA;
     if (ERROR_SUCCESS == Error &&
         0 != State->StorageUnit->DispatcherThread)
         for (UINT32 I = 0; sizeof DataBuffer > I; I++)
@@ -843,7 +935,8 @@ static DWORD ring_test_disk_read_at(
                 Error = ERROR_INVALID_DATA;
                 break;
             }
-    CloseHandle(DiskHandle);
+    if (OwnHandle)
+        CloseHandle(DiskHandle);
     return Error;
 }
 
@@ -1001,6 +1094,219 @@ static DWORD ring_test_complete_one_manually(RING_TEST_STATE *State,
     return 1 == KickParams.Consumed ? ERROR_SUCCESS : ERROR_INVALID_DATA;
 }
 
+static DWORD WINAPI ring_test_open_disk_thread(PVOID Data)
+{
+    RING_TEST_OPEN_THREAD *Open = Data;
+    STORAGE_PROPERTY_QUERY Query;
+    union
+    {
+        LARGE_INTEGER Alignment;
+        UINT8 Bytes[4096];
+    } DescriptorBuffer;
+    DWORD BytesReturned = 0;
+    char ExpectedSerial[37];
+    char ActualSerial[256] = "<unavailable>";
+
+    Open->DiskHandle = CreateFileW(Open->State->DiskPath,
+        Open->DesiredAccess, FILE_SHARE_READ | FILE_SHARE_WRITE, 0,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
+    Open->Error = INVALID_HANDLE_VALUE == Open->DiskHandle ?
+        GetLastError() : ERROR_SUCCESS;
+
+    sprintf_s(ExpectedSerial, sizeof ExpectedSerial,
+        "%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        Open->State->Guid.Data1, Open->State->Guid.Data2,
+        Open->State->Guid.Data3, Open->State->Guid.Data4[0],
+        Open->State->Guid.Data4[1], Open->State->Guid.Data4[2],
+        Open->State->Guid.Data4[3], Open->State->Guid.Data4[4],
+        Open->State->Guid.Data4[5], Open->State->Guid.Data4[6],
+        Open->State->Guid.Data4[7]);
+
+    if (ERROR_SUCCESS == Open->Error)
+    {
+        OVERLAPPED Overlapped;
+        BOOL Success;
+
+        memset(&Query, 0, sizeof Query);
+        Query.PropertyId = StorageDeviceProperty;
+        Query.QueryType = PropertyStandardQuery;
+        memset(&Overlapped, 0, sizeof Overlapped);
+        Overlapped.hEvent = CreateEventW(0, TRUE, FALSE, 0);
+        if (0 == Overlapped.hEvent)
+            Open->Error = GetLastError();
+        else
+        {
+            Success = DeviceIoControl(Open->DiskHandle,
+                IOCTL_STORAGE_QUERY_PROPERTY, &Query, sizeof Query,
+                DescriptorBuffer.Bytes, sizeof DescriptorBuffer.Bytes,
+                &BytesReturned, &Overlapped);
+            if (!Success)
+            {
+                Open->Error = GetLastError();
+                if (ERROR_IO_PENDING == Open->Error)
+                {
+                    DWORD WaitResult = WaitForSingleObject(
+                        Overlapped.hEvent, INFINITE);
+                    if (WAIT_OBJECT_0 != WaitResult)
+                        Open->Error = WAIT_FAILED == WaitResult ?
+                            GetLastError() : ERROR_GEN_FAILURE;
+                    else if (!GetOverlappedResult(Open->DiskHandle,
+                            &Overlapped, &BytesReturned, FALSE))
+                        Open->Error = GetLastError();
+                    else
+                        Open->Error = ERROR_SUCCESS;
+                }
+            }
+            CloseHandle(Overlapped.hEvent);
+        }
+    }
+
+    if (ERROR_SUCCESS == Open->Error &&
+        BytesReturned >= sizeof(STORAGE_DEVICE_DESCRIPTOR))
+    {
+        PSTORAGE_DEVICE_DESCRIPTOR Descriptor =
+            (PSTORAGE_DEVICE_DESCRIPTOR)DescriptorBuffer.Bytes;
+        if (0 != Descriptor->SerialNumberOffset &&
+            Descriptor->SerialNumberOffset < BytesReturned)
+        {
+            char *SerialValue = (char *)DescriptorBuffer.Bytes +
+                Descriptor->SerialNumberOffset;
+            size_t SerialLength = strnlen(SerialValue,
+                BytesReturned - Descriptor->SerialNumberOffset);
+            while (0 < SerialLength && ' ' == SerialValue[SerialLength - 1])
+                SerialLength--;
+            size_t CopyLength = min(SerialLength,
+                sizeof ActualSerial - 1);
+            memcpy(ActualSerial, SerialValue, CopyLength);
+            ActualSerial[CopyLength] = '\0';
+            if (0 != _stricmp(ActualSerial, ExpectedSerial))
+                Open->Error = ERROR_NOT_FOUND;
+        }
+        else
+            Open->Error = ERROR_NOT_FOUND;
+    }
+    else if (ERROR_SUCCESS == Open->Error)
+        Open->Error = ERROR_INVALID_DATA;
+
+    tlib_printf("manual disk probe: path=%ls serial=%s expected=%s error=%lu\n",
+        Open->State->DiskPath, ActualSerial, ExpectedSerial,
+        (unsigned long)Open->Error);
+    if (ERROR_SUCCESS != Open->Error &&
+        INVALID_HANDLE_VALUE != Open->DiskHandle)
+    {
+        CloseHandle(Open->DiskHandle);
+        Open->DiskHandle = INVALID_HANDLE_VALUE;
+    }
+    SetEvent(Open->Finished);
+    return Open->Error;
+}
+
+static DWORD ring_test_open_disk_manual(
+    RING_TEST_STATE *State,
+    DWORD DesiredAccess)
+{
+    RING_TEST_OPEN_THREAD Open;
+    HANDLE Thread;
+    ULONGLONG Deadline = GetTickCount64() + RingTestWaitTimeoutMs;
+    DWORD Error = ERROR_SUCCESS;
+
+    if (0 != State->ManualDiskHandle)
+        return ERROR_SUCCESS;
+
+    memset(&Open, 0, sizeof Open);
+    Open.State = State;
+    Open.DesiredAccess = DesiredAccess;
+    Open.DiskHandle = INVALID_HANDLE_VALUE;
+    Open.Finished = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == Open.Finished)
+        return GetLastError();
+    Thread = CreateThread(0, 0, ring_test_open_disk_thread,
+        &Open, 0, 0);
+    if (0 == Thread)
+    {
+        Error = GetLastError();
+        CloseHandle(Open.Finished);
+        return Error;
+    }
+
+    while (WAIT_OBJECT_0 != WaitForSingleObject(Open.Finished, 0))
+    {
+        SPD_IOCTL_RING_WAIT_PARAMS WaitParams;
+        BOOLEAN TestRead;
+        HANDLE WaitHandles[2];
+        DWORD Remaining = (DWORD)(Deadline > GetTickCount64() ?
+            Deadline - GetTickCount64() : 0);
+        DWORD WaitResult;
+
+        if (0 == Remaining)
+        {
+            Error = ERROR_TIMEOUT;
+            break;
+        }
+
+        Error = ring_test_begin_wait(State, 1);
+        if (ERROR_SUCCESS != Error)
+            break;
+
+        WaitHandles[0] = Open.Finished;
+        WaitHandles[1] = State->ManualWaitEvent;
+        WaitResult = WaitForMultipleObjects(ARRAYSIZE(WaitHandles),
+            WaitHandles, FALSE, Remaining);
+        if (WAIT_OBJECT_0 == WaitResult)
+        {
+            if (WAIT_OBJECT_0 != WaitForSingleObject(
+                    State->ManualWaitEvent, 0))
+                break;
+        }
+        else if (WAIT_OBJECT_0 + 1 != WaitResult)
+        {
+            Error = WAIT_TIMEOUT == WaitResult ? ERROR_TIMEOUT :
+                GetLastError();
+            break;
+        }
+
+        memset(&WaitParams, 0, sizeof WaitParams);
+        Error = ring_test_finish_wait(State, &WaitParams, 0);
+        if (ERROR_SUCCESS != Error)
+            break;
+        if (1 != WaitParams.Produced)
+        {
+            Error = ERROR_INVALID_DATA;
+            break;
+        }
+        Error = ring_test_complete_one_manually(State, &TestRead);
+        if (ERROR_SUCCESS != Error)
+            break;
+        ASSERT(!TestRead);
+    }
+
+    if (ERROR_SUCCESS != Error && State->ManualWaitOutstanding)
+    {
+        SPD_IOCTL_RING_WAIT_PARAMS UnusedParams;
+        (void)ring_test_finish_wait(State, &UnusedParams, 0);
+    }
+
+    if (WAIT_OBJECT_0 != WaitForSingleObject(Open.Finished, 0))
+    {
+        /* RING_STOP above releases the service IRP blocking CreateFile. */
+        SpdStorageUnitShutdown(State->StorageUnit);
+        WaitForSingleObject(Open.Finished, INFINITE);
+    }
+    WaitForSingleObject(Thread, INFINITE);
+    CloseHandle(Thread);
+    CloseHandle(Open.Finished);
+
+    if (ERROR_SUCCESS == Error)
+        Error = Open.Error;
+    if (ERROR_SUCCESS == Error)
+        State->ManualDiskHandle = Open.DiskHandle;
+    else if (INVALID_HANDLE_VALUE != Open.DiskHandle)
+        CloseHandle(Open.DiskHandle);
+
+    return Error;
+}
+
 static VOID ring_test_wait_for_disk_manual(RING_TEST_STATE *State)
 {
     ULONGLONG Deadline = GetTickCount64() + 15000;
@@ -1031,14 +1337,28 @@ static VOID ring_test_wait_for_disk_manual(RING_TEST_STATE *State)
     }
 
     if (L'\0' == State->DiskPath[0])
+    {
         ring_test_log_discovery_timeout(State);
+        if (ERROR_SUCCESS == WaitError)
+            WaitError = ERROR_TIMEOUT;
+    }
+    if (ERROR_SUCCESS == WaitError)
+    {
+        WaitError = ring_test_open_disk_manual(State,
+            GENERIC_READ | GENERIC_WRITE);
+        if (ERROR_SUCCESS != WaitError)
+            tlib_printf("manual disk open while servicing ring failed: error=%lu\n",
+                (unsigned long)WaitError);
+    }
     if (ERROR_SUCCESS != WaitError)
     {
         tlib_printf("manual disk discovery RING_WAIT failed: error=%lu\n",
             (unsigned long)WaitError);
         ring_test_destroy(State);
+        ASSERT(ERROR_SUCCESS == WaitError);
     }
     ASSERT(L'\0' != State->DiskPath[0]);
+    ASSERT(0 != State->ManualDiskHandle);
 }
 
 static DWORD ring_test_manual_complete_until_bulk_io(
@@ -1245,9 +1565,7 @@ static void ioctl_ring_manual_bulk_visibility_test(void)
 
     ring_test_create(&State, &RingTestGuidManualBulk, 2);
     ring_test_wait_for_disk_manual(&State);
-    DiskHandle = CreateFileW(State.DiskPath, GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
+    DiskHandle = State.ManualDiskHandle;
     ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
 
     memset(WriteData, 0x3c, sizeof WriteData);
@@ -1260,7 +1578,6 @@ static void ioctl_ring_manual_bulk_visibility_test(void)
     for (UINT32 I = 0; sizeof ReadData > I; I++)
         ASSERT(0x5a == ReadData[I]);
 
-    CloseHandle(DiskHandle);
     ring_test_destroy(&State);
 }
 
@@ -1372,11 +1689,38 @@ static void ioctl_ring_wraparound_test(void)
 static void ioctl_ring_async_response_test(void)
 {
     RING_TEST_STATE State;
+    DWORD Error;
+    DWORD DispatcherError = ERROR_SUCCESS;
 
     ring_test_create(&State, &RingTestGuidAsync, 2);
     ring_test_start(&State, 2);
     InterlockedExchange(&State.AsyncMode, RingTestAsyncEarly);
-    ASSERT(ERROR_SUCCESS == ring_test_disk_read(&State));
+    Error = ring_test_disk_read(&State);
+    if (ERROR_SUCCESS != Error)
+    {
+        SPD_RING_HEADER *Header = State.StorageUnit->SharedRingHeader;
+        SpdStorageUnitGetDispatcherError(State.StorageUnit,
+            &DispatcherError);
+        tlib_printf("async early read failed error=%lu dispatcher=%lu failure=%ld readCallbacks=%ld testReads=%ld req=%lu/%lu cq=%lu/%lu\n",
+            (unsigned long)Error,
+            (unsigned long)DispatcherError,
+            InterlockedCompareExchange(&State.Failure, 0, 0),
+            InterlockedCompareExchange(&State.ReadCallbacks, 0, 0),
+            InterlockedCompareExchange(&State.TestReadCalls, 0, 0),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->RequestHead.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->RequestTail.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->CompletionHead.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->CompletionTail.Value));
+        fflush(stdout);
+        State.ExpectedDispatcherError = DispatcherError;
+        ring_test_destroy(&State);
+        ASSERT(ERROR_SUCCESS == Error);
+        return;
+    }
     InterlockedExchange(&State.AsyncMode, RingTestAsyncDeferred);
     ASSERT(ERROR_SUCCESS == ring_test_disk_read(&State));
     InterlockedExchange(&State.AsyncMode, RingTestAsyncNone);
@@ -1411,14 +1755,66 @@ static void ioctl_ring_batch_full_boundary_test(void)
     tlib_printf("batch stage: manual discovery complete path=%ls\n",
         State.DiskPath);
     fflush(stdout);
-    tlib_printf("batch stage: disk open begin\n");
-    fflush(stdout);
-    DiskHandle = CreateFileW(State.DiskPath, GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
+    DiskHandle = State.ManualDiskHandle;
     ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
-    tlib_printf("batch stage: disk open complete\n");
+    tlib_printf("batch stage: reusing manually opened disk handle\n");
     fflush(stdout);
+
+    Header = State.StorageUnit->SharedRingHeader;
+    RequestRing = (SPD_RING_REQUEST *)
+        ((PUINT8)State.StorageUnit->SharedRingAddress +
+        Header->RequestOffset);
+    CompletionRing = (SPD_RING_COMPLETION *)
+        ((PUINT8)State.StorageUnit->SharedRingAddress +
+        Header->CompletionOffset);
+
+    /*
+     * Disk open and the serial query can leave one service request in
+     * flight when their helper thread returns. Retire a completed wait and
+     * drain any request it published before taking the target-read baseline.
+     */
+    if (State.ManualWaitOutstanding &&
+        WAIT_OBJECT_0 == WaitForSingleObject(State.ManualWaitEvent, 0))
+    {
+        memset(&WaitParams, 0, sizeof WaitParams);
+        Error = ring_test_finish_wait(&State, &WaitParams, 0);
+        ASSERT(ERROR_SUCCESS == Error);
+        ASSERT(0 != WaitParams.Produced);
+    }
+
+    RequestHead = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+    RequestTail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+    CompletionHead =
+        SpdRingLoadAcquire32(&Header->CompletionHead.Value);
+    CompletionTail =
+        SpdRingLoadAcquire32(&Header->CompletionTail.Value);
+    while (RequestHead != RequestTail)
+    {
+        BOOLEAN TestRead;
+
+        ASSERT(RequestTail - RequestHead <= Header->QueueDepth);
+        ASSERT(CompletionTail == CompletionHead);
+        ASSERT(1 == RequestTail - RequestHead);
+        Error = ring_test_complete_one_manually(&State, &TestRead);
+        ASSERT(ERROR_SUCCESS == Error);
+        ASSERT(!TestRead);
+
+        RequestHead = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+        RequestTail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+        CompletionHead =
+            SpdRingLoadAcquire32(&Header->CompletionHead.Value);
+        CompletionTail =
+            SpdRingLoadAcquire32(&Header->CompletionTail.Value);
+    }
+    ASSERT(CompletionHead == CompletionTail);
+
+    /* Snapshot an empty request ring before submitting the two target SRBs. */
+    RequestHead = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+    RequestTail = RequestHead;
+    CompletionHead =
+        SpdRingLoadAcquire32(&Header->CompletionHead.Value);
+    CompletionTail = CompletionHead;
+
     memset(Overlapped, 0, sizeof Overlapped);
     for (UINT32 I = 0; ARRAYSIZE(Overlapped) > I; I++)
     {
@@ -1441,19 +1837,6 @@ static void ioctl_ring_batch_full_boundary_test(void)
     }
     tlib_printf("batch stage: reads submitted\n");
     fflush(stdout);
-
-    Header = State.StorageUnit->SharedRingHeader;
-    RequestRing = (SPD_RING_REQUEST *)
-        ((PUINT8)State.StorageUnit->SharedRingAddress +
-        Header->RequestOffset);
-    CompletionRing = (SPD_RING_COMPLETION *)
-        ((PUINT8)State.StorageUnit->SharedRingAddress +
-        Header->CompletionOffset);
-    RequestHead = SpdRingLoadAcquire32(&Header->RequestHead.Value);
-    CompletionHead =
-        SpdRingLoadAcquire32(&Header->CompletionHead.Value);
-    CompletionTail =
-        SpdRingLoadAcquire32(&Header->CompletionTail.Value);
 
     /*
      * RING_WAIT is woken by the first queued SRB and batches only the SRBs
@@ -1487,15 +1870,33 @@ static void ioctl_ring_batch_full_boundary_test(void)
         RequestTail =
             SpdRingLoadAcquire32(&Header->RequestTail.Value);
         if (0 == WaitParams.Produced ||
-            RequestTail - PreviousTail != WaitParams.Produced)
+            RequestTail - RequestHead > Header->QueueDepth ||
+            RequestTail == RequestHead)
         {
-            tlib_printf("batch RING_WAIT made no progress: produced=%lu tail=%lu previous=%lu\n",
+            BOOLEAN Valid = 0 != WaitParams.Produced &&
+                RequestTail - RequestHead <= Header->QueueDepth &&
+                RequestTail != RequestHead;
+
+            tlib_printf("batch RING_WAIT produced without queued request: produced=%lu flags=%08lx req=%lu/%lu previousTail=%lu max=%lu outstanding=%u header=%p mapping=%p\n",
+                (unsigned long)WaitParams.Produced,
+                (unsigned long)WaitParams.Flags,
+                (unsigned long)SpdRingLoadAcquire32(
+                    &Header->RequestHead.Value),
+                (unsigned long)RequestTail,
+                (unsigned long)PreviousTail,
+                (unsigned long)WaitParams.MaxRequests,
+                (unsigned)State.ManualWaitOutstanding,
+                Header,
+                State.StorageUnit->SharedRingAddress);
+            ring_test_destroy(&State);
+            ASSERT(Valid);
+            return;
+        }
+        if (RequestTail == PreviousTail)
+            tlib_printf("batch RING_WAIT reused already-published request: produced=%lu tail=%lu head=%lu\n",
                 (unsigned long)WaitParams.Produced,
                 (unsigned long)RequestTail,
-                (unsigned long)PreviousTail);
-            ring_test_destroy(&State);
-            ASSERT(0 != WaitParams.Produced);
-        }
+                (unsigned long)RequestHead);
     }
 
     ASSERT(2 == RequestTail - RequestHead);
@@ -1597,7 +1998,6 @@ static void ioctl_ring_batch_full_boundary_test(void)
             WaitForSingleObject(Overlapped[1 - I].hEvent, 5000);
             CloseHandle(Overlapped[I].hEvent);
             CloseHandle(Overlapped[1 - I].hEvent);
-            CloseHandle(DiskHandle);
             ring_test_destroy(&State);
             ASSERT(FALSE);
         }
@@ -1606,7 +2006,6 @@ static void ioctl_ring_batch_full_boundary_test(void)
             ASSERT(0x5a == DataBuffers[I][J]);
         CloseHandle(Overlapped[I].hEvent);
     }
-    CloseHandle(DiskHandle);
     ring_test_destroy(&State);
 }
 
@@ -1778,7 +2177,30 @@ static void ioctl_ring_out_of_order_worker_test(void)
     ASSERT(WAIT_TIMEOUT == WaitForSingleObject(Slow.Finished, 0));
 
     SetEvent(State.ReleaseSlowRead);
-    ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(SlowThread, 10000));
+    DWORD SlowWaitResult = WaitForSingleObject(SlowThread, 10000);
+    if (WAIT_OBJECT_0 != SlowWaitResult)
+    {
+        SPD_RING_HEADER *Header = State.StorageUnit->SharedRingHeader;
+        DWORD DispatcherError = ERROR_SUCCESS;
+        SpdStorageUnitGetDispatcherError(State.StorageUnit,
+            &DispatcherError);
+        tlib_printf("out-of-order slow read stalled: wait=%lu dispatcher=%lu failure=%ld readCallbacks=%ld testReads=%ld req=%lu/%lu cq=%lu/%lu\n",
+            (unsigned long)SlowWaitResult,
+            (unsigned long)DispatcherError,
+            InterlockedCompareExchange(&State.Failure, 0, 0),
+            InterlockedCompareExchange(&State.ReadCallbacks, 0, 0),
+            InterlockedCompareExchange(&State.TestReadCalls, 0, 0),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->RequestHead.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->RequestTail.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->CompletionHead.Value),
+            (unsigned long)SpdRingLoadAcquire32(
+                &Header->CompletionTail.Value));
+        fflush(stdout);
+    }
+    ASSERT(WAIT_OBJECT_0 == SlowWaitResult);
     ASSERT(ERROR_SUCCESS == Slow.Error);
     CloseHandle(SlowThread);
     CloseHandle(FastThread);

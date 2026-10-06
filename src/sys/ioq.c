@@ -47,12 +47,30 @@ NTSTATUS SpdIoqCreate(PVOID DeviceExtension, SPD_IOQ **PIoq)
 
 VOID SpdIoqDelete(SPD_IOQ *Ioq)
 {
-    SpdIoqReset(Ioq, FALSE);
+    SpdIoqReset(Ioq, FALSE, SpdIoqResetReasonDelete);
     SpdQeventFinalize(&Ioq->PendingEvent);
     SpdFree(Ioq, SpdTagIoq);
 }
 
-VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop)
+static const char *SpdIoqResetReasonString(
+    SPD_IOQ_RESET_REASON Reason)
+{
+    switch (Reason)
+    {
+    case SpdIoqResetReasonDelete: return "Delete";
+    case SpdIoqResetReasonBusReset: return "BusReset";
+    case SpdIoqResetReasonDeviceReset: return "DeviceReset";
+    case SpdIoqResetReasonLuReset: return "LuReset";
+    case SpdIoqResetReasonRingFailure: return "RingFailure";
+    case SpdIoqResetReasonRingStop: return "RingStop";
+    case SpdIoqResetReasonRingClose: return "RingClose";
+    case SpdIoqResetReasonRemoval: return "Removal";
+    default: return "Unknown";
+    }
+}
+
+VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+    SPD_IOQ_RESET_REASON Reason)
 {
     KIRQL Irql;
 
@@ -61,6 +79,18 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop)
     if (!Ioq->Stopped)
     {
         PLIST_ENTRY PendingEntry, ProcessEntry, Flink;
+        ULONG PendingCount = 0;
+        ULONG ProcessCount = 0;
+
+        for (PLIST_ENTRY Entry = Ioq->PendingList.Flink;
+            Entry != &Ioq->PendingList; Entry = Entry->Flink)
+            PendingCount++;
+        for (PLIST_ENTRY Entry = Ioq->ProcessList.Flink;
+            Entry != &Ioq->ProcessList; Entry = Entry->Flink)
+            ProcessCount++;
+        DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s stop=%u pending=%lu process-count=%lu\n",
+            SpdIoqResetReasonString(Reason), (unsigned)Stop,
+            PendingCount, ProcessCount);
 
         PendingEntry = Ioq->PendingList.Flink;
         ProcessEntry = Ioq->ProcessList.Flink;
@@ -74,18 +104,28 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop)
         {
             /* store Flink now, because *PendingEntry becomes invalid after SpdSrbComplete */
             Flink = PendingEntry->Flink;
+            SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+                PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+            DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s pending ext=%p srb=%p aborted\n",
+                SpdIoqResetReasonString(Reason), SrbExtension,
+                SrbExtension->Srb);
             SpdSrbComplete(
                 Ioq->DeviceExtension,
-                CONTAINING_RECORD(PendingEntry, SPD_SRB_EXTENSION, ListEntry)->Srb,
+                SrbExtension->Srb,
                 SRB_STATUS_ABORTED);
         }
         for (; ProcessEntry != &Ioq->ProcessList; ProcessEntry = Flink)
         {
             /* store Flink now, because *ProcessEntry becomes invalid after SpdSrbComplete */
             Flink = ProcessEntry->Flink;
+            SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+                ProcessEntry, SPD_SRB_EXTENSION, ListEntry);
+            DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s process ext=%p srb=%p aborted\n",
+                SpdIoqResetReasonString(Reason), SrbExtension,
+                SrbExtension->Srb);
             SpdSrbComplete(
                 Ioq->DeviceExtension,
-                CONTAINING_RECORD(ProcessEntry, SPD_SRB_EXTENSION, ListEntry)->Srb,
+                SrbExtension->Srb,
                 SRB_STATUS_ABORTED);
         }
 
@@ -117,7 +157,7 @@ BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq)
 
 NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
 {
-    NTSTATUS Result = STATUS_UNSUCCESSFUL;
+    NTSTATUS Result = STATUS_NOT_FOUND;
     KIRQL Irql;
 
     KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
@@ -125,29 +165,63 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
     if (!Ioq->Stopped)
     {
         SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
-        ULONG Index;
+        BOOLEAN Pending = FALSE;
+        BOOLEAN Processing = FALSE;
+        ULONG Index = 0;
 
         ASSERT(Srb == SrbExtension->Srb);
 
-        Index = SpdHashMixPointer(SrbExtension) % Ioq->ProcessBucketCount;
-        for (PVOID *P = &Ioq->ProcessBuckets[Index]; *P; P = &((SPD_SRB_EXTENSION *)(*P))->HashNext)
-            if (*P == SrbExtension)
-            {
-                *P = SrbExtension->HashNext;
-                SrbExtension->HashNext = 0;
+        if (Srb == SrbExtension->Srb &&
+            0 != SrbExtension->ListEntry.Flink &&
+            0 != SrbExtension->ListEntry.Blink)
+        {
+            for (PLIST_ENTRY Entry = Ioq->PendingList.Flink;
+                Entry != &Ioq->PendingList; Entry = Entry->Flink)
+                if (Entry == &SrbExtension->ListEntry)
+                {
+                    Pending = TRUE;
+                    break;
+                }
 
-                break;
+            Index = SpdHashMixPointer(SrbExtension) %
+                Ioq->ProcessBucketCount;
+            if (!Pending)
+            {
+                for (PVOID *P = &Ioq->ProcessBuckets[Index]; *P;
+                    P = &((SPD_SRB_EXTENSION *)(*P))->HashNext)
+                    if (*P == SrbExtension)
+                    {
+                        *P = SrbExtension->HashNext;
+                        SrbExtension->HashNext = 0;
+                        Processing = TRUE;
+                        break;
+                    }
             }
 
-        RemoveEntryList(&SrbExtension->ListEntry);
-        SrbExtension->ListEntry.Flink = SrbExtension->ListEntry.Blink = 0;
-
-        SrbExtension->Srb = 0;
-
-        SpdSrbComplete(Ioq->DeviceExtension, Srb, SRB_STATUS_ABORTED);
-
-        Result = STATUS_SUCCESS;
+            if (Pending || Processing)
+            {
+                DbgPrint(DRIVER_NAME ": IOQ CANCEL target-ext=%p target-srb=%p state=%s bucket=%lu\n",
+                    SrbExtension, Srb,
+                    Pending ? "pending" : "process", Index);
+                RemoveEntryList(&SrbExtension->ListEntry);
+                SrbExtension->ListEntry.Flink =
+                    SrbExtension->ListEntry.Blink = 0;
+                SrbExtension->Srb = 0;
+                SpdSrbComplete(Ioq->DeviceExtension, Srb,
+                    SRB_STATUS_ABORTED);
+                Result = STATUS_SUCCESS;
+            }
+            else
+                DbgPrint(DRIVER_NAME ": IOQ CANCEL target-ext=%p target-srb=%p NOT_FOUND bucket=%lu\n",
+                    SrbExtension, Srb, Index);
+        }
+        else
+            DbgPrint(DRIVER_NAME ": IOQ CANCEL target-ext=%p target-srb=%p NOT_FOUND\n",
+                SrbExtension, Srb);
     }
+    else
+        DbgPrint(DRIVER_NAME ": IOQ CANCEL target-srb=%p CANCELLED stopped=1\n",
+            Srb);
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
 
@@ -164,12 +238,15 @@ NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
     if (!Ioq->Stopped)
     {
         SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
+        PUCHAR Cdb = (PUCHAR)SrbGetCdb(Srb);
 
         ASSERT(0 == SrbExtension->Srb);
         SrbExtension->Srb = Srb;
 
         ASSERT(0 == SrbExtension->ListEntry.Flink && 0 == SrbExtension->ListEntry.Blink);
         InsertTailList(&Ioq->PendingList, &SrbExtension->ListEntry);
+        DbgPrint(DRIVER_NAME ": IOQ POST ext=%p srb=%p cdb=%02x\n",
+            SrbExtension, Srb, (unsigned)Cdb[0]);
 
         /* queue is not empty; wake up a waiter */
         SpdQeventSetNoLock(&Ioq->PendingEvent);
@@ -227,6 +304,8 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
 #endif
         SrbExtension->HashNext = Ioq->ProcessBuckets[Index];
         Ioq->ProcessBuckets[Index] = SrbExtension;
+        DbgPrint(DRIVER_NAME ": IOQ START ext=%p srb=%p pending-to-process bucket=%lu\n",
+            SrbExtension, SrbExtension->Srb, Index);
 
         if (Wake)
             SpdQeventSetNoLock(&Ioq->PendingEvent);
@@ -324,6 +403,9 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
             if (*P == SrbExtension)
             {
                 *P = SrbExtension->HashNext;
+                DbgPrint(DRIVER_NAME ": IOQ END hint=%p FOUND ext=%p srb=%p bucket=%lu\n",
+                    SrbExtension0, SrbExtension, SrbExtension->Srb,
+                    Index);
 
                 RemoveEntryList(&SrbExtension->ListEntry);
 
@@ -352,7 +434,26 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
             }
     }
     else
+    {
+        DbgPrint(DRIVER_NAME ": IOQ END hint=%p CANCELLED stopped=1\n",
+            SrbExtension0);
         Result = STATUS_CANCELLED;
+    }
+
+    if (STATUS_NOT_FOUND == Result)
+    {
+        SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
+        ULONG Index = SpdHashMixPointer(SrbExtension) %
+            Ioq->ProcessBucketCount;
+
+        DbgPrint(DRIVER_NAME ": IOQ END hint=%p NOT_FOUND bucket=%lu contents:",
+            SrbExtension0, Index);
+        for (PVOID P = Ioq->ProcessBuckets[Index]; P;
+            P = ((SPD_SRB_EXTENSION *)P)->HashNext)
+            DbgPrint(" %p(srb=%p)", P,
+                ((SPD_SRB_EXTENSION *)P)->Srb);
+        DbgPrint("\n");
+    }
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
 

@@ -99,7 +99,8 @@ BOOLEAN SpdHwResetBus(PVOID DeviceExtension0, ULONG PathId)
             if (0 == StorageUnit)
                 continue;
 
-            SpdIoqReset(StorageUnit->Ioq, FALSE);
+            SpdIoqReset(StorageUnit->Ioq, FALSE,
+                SpdIoqResetReasonBusReset);
 
             SpdStorageUnitDereference(DeviceExtension, StorageUnit);
         }

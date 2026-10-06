@@ -329,9 +329,23 @@ typedef struct
     ULONG ProcessBucketCount;
     PVOID ProcessBuckets[];
 } SPD_IOQ;
+
+typedef enum
+{
+    SpdIoqResetReasonDelete,
+    SpdIoqResetReasonBusReset,
+    SpdIoqResetReasonDeviceReset,
+    SpdIoqResetReasonLuReset,
+    SpdIoqResetReasonRingFailure,
+    SpdIoqResetReasonRingStop,
+    SpdIoqResetReasonRingClose,
+    SpdIoqResetReasonRemoval
+} SPD_IOQ_RESET_REASON;
+
 NTSTATUS SpdIoqCreate(PVOID DeviceExtension, SPD_IOQ **PIoq);
 VOID SpdIoqDelete(SPD_IOQ *Ioq);
-VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop);
+VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
+    SPD_IOQ_RESET_REASON Reason);
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);
 NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb);
 NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb);

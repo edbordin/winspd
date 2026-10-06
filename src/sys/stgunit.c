@@ -180,7 +180,8 @@ static VOID SpdStorageUnitRingMarkFailed(
     Ring->Failed = TRUE;
     Ring->Stopping = TRUE;
     KeReleaseSpinLock(&Ring->Lock, Irql);
-    SpdIoqReset(StorageUnit->Ioq, TRUE);
+    SpdIoqReset(StorageUnit->Ioq, TRUE,
+        SpdIoqResetReasonRingFailure);
     SpdStorageUnitRingNotifyRequest(StorageUnit);
 }
 
@@ -417,7 +418,8 @@ VOID SpdStorageUnitRingClose(
     Ring->Stopping = TRUE;
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
-    SpdIoqReset(StorageUnit->Ioq, TRUE);
+    SpdIoqReset(StorageUnit->Ioq, TRUE,
+        SpdIoqResetReasonRingClose);
     SpdStorageUnitRingNotifyRequest(StorageUnit);
     KeWaitForSingleObject(&Ring->IdleEvent,
         Executive, KernelMode, FALSE, NULL);
@@ -444,7 +446,8 @@ NTSTATUS SpdStorageUnitRingStop(
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
     /* Keep the section mapped while userspace drains and joins its threads. */
-    SpdIoqReset(StorageUnit->Ioq, TRUE);
+    SpdIoqReset(StorageUnit->Ioq, TRUE,
+        SpdIoqResetReasonRingStop);
     SpdStorageUnitRingNotifyRequest(StorageUnit);
     return STATUS_SUCCESS;
 }
@@ -699,7 +702,8 @@ static VOID SpdStorageUnitRingWaitDpc(
             }
             Ring->Stopping = TRUE;
             KeReleaseSpinLock(&Ring->Lock, Irql);
-            SpdIoqReset(StorageUnit->Ioq, TRUE);
+            SpdIoqReset(StorageUnit->Ioq, TRUE,
+                SpdIoqResetReasonRingStop);
             Produced = 0;
             goto complete_wait;
         }
@@ -717,7 +721,8 @@ static VOID SpdStorageUnitRingWaitDpc(
             Ring->Failed = TRUE;
             Ring->Stopping = TRUE;
             KeReleaseSpinLock(&Ring->Lock, Irql);
-            SpdIoqReset(StorageUnit->Ioq, TRUE);
+            SpdIoqReset(StorageUnit->Ioq, TRUE,
+                SpdIoqResetReasonRingFailure);
             Produced = 0;
             goto complete_wait;
         }
@@ -878,7 +883,8 @@ VOID SpdStorageUnitRingStopForRemoval(SPD_STORAGE_UNIT *StorageUnit)
     Ring->Stopping = TRUE;
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
-    SpdIoqReset(StorageUnit->Ioq, TRUE);
+    SpdIoqReset(StorageUnit->Ioq, TRUE,
+        SpdIoqResetReasonRemoval);
     SpdStorageUnitRingNotifyRequest(StorageUnit);
     KeWaitForSingleObject(&Ring->IdleEvent,
         Executive, KernelMode, FALSE, NULL);
@@ -1025,7 +1031,8 @@ exit:
     Ring->KickActive = FALSE;
     KeReleaseSpinLock(&Ring->Lock, Irql);
     if (Failed)
-        SpdIoqReset(StorageUnit->Ioq, TRUE);
+        SpdIoqReset(StorageUnit->Ioq, TRUE,
+            SpdIoqResetReasonRingFailure);
     if (0 != Consumed || Failed)
         SpdStorageUnitRingNotifyRequest(StorageUnit);
     SpdStorageUnitRingLeave(StorageUnit);
@@ -1317,7 +1324,8 @@ NTSTATUS SpdStorageUnitUnprovision(
     }
 
     /* stop the ioq before reclaiming ring request state and mappings */
-    SpdIoqReset(StorageUnit->Ioq, TRUE);
+    SpdIoqReset(StorageUnit->Ioq, TRUE,
+        SpdIoqResetReasonRemoval);
     SpdStorageUnitRingClose(StorageUnit,
         0 != StorageUnit->Ring.SectionHandle &&
         StorageUnit->Ring.UserProcessId !=

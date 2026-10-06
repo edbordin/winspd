@@ -90,13 +90,25 @@ BOOLEAN SpdHwStartIo(PVOID DeviceExtension, PSCSI_REQUEST_BLOCK Srb0)
 UCHAR SpdSrbAbortCommand(PVOID DeviceExtension, PVOID Srb)
 {
     SPD_STORAGE_UNIT *StorageUnit;
+    PVOID TargetSrb;
     NTSTATUS Result;
 
     StorageUnit = SpdStorageUnitReference(DeviceExtension, Srb);
     if (0 == StorageUnit)
         return SRB_STATUS_NO_DEVICE;
 
-    Result = SpdIoqCancelSrb(StorageUnit->Ioq, Srb);
+    TargetSrb = SrbGetNextSrb(Srb);
+    if (0 == TargetSrb)
+    {
+        DbgPrint(DRIVER_NAME ": ABORT abort-srb=%p target-srb=NULL\n", Srb);
+        Result = STATUS_NOT_FOUND;
+    }
+    else
+    {
+        DbgPrint(DRIVER_NAME ": ABORT abort-srb=%p target-srb=%p target-ext=%p\n",
+            Srb, TargetSrb, SpdSrbExtension(TargetSrb));
+        Result = SpdIoqCancelSrb(StorageUnit->Ioq, TargetSrb);
+    }
 
     SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 
@@ -127,7 +139,8 @@ UCHAR SpdSrbResetDevice(PVOID DeviceExtension, PVOID Srb)
     if (0 == StorageUnit)
         return SRB_STATUS_NO_DEVICE;
 
-    SpdIoqReset(StorageUnit->Ioq, FALSE);
+    SpdIoqReset(StorageUnit->Ioq, FALSE,
+        SpdIoqResetReasonDeviceReset);
 
     SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 
@@ -142,7 +155,8 @@ UCHAR SpdSrbResetLogicalUnit(PVOID DeviceExtension, PVOID Srb)
     if (0 == StorageUnit)
         return SRB_STATUS_NO_DEVICE;
 
-    SpdIoqReset(StorageUnit->Ioq, FALSE);
+    SpdIoqReset(StorageUnit->Ioq, FALSE,
+        SpdIoqResetReasonLuReset);
 
     SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 

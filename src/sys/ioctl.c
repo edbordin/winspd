@@ -361,7 +361,8 @@ static VOID SpdIoctlRingClose(SPD_DEVICE_EXTENSION *DeviceExtension,
     {
         /* Ring close is final for this storage unit. Wake any blocked WAIT
          * and abort user-owned requests before the shared state is unmapped. */
-        SpdIoqReset(StorageUnit->Ioq, TRUE);
+        SpdIoqReset(StorageUnit->Ioq, TRUE,
+            SpdIoqResetReasonRingClose);
         SpdStorageUnitRingClose(StorageUnit, FALSE);
         Irp->IoStatus.Status = STATUS_SUCCESS;
     }

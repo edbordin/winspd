@@ -1200,6 +1200,14 @@ static VOID SpdRingHandleKickCompletion(
     }
 
     SpdRingPublishCompletions(Runtime);
+
+    /*
+     * A completion may have been published while the completed KICK was
+     * still outstanding. PublishCompletions can have no DoneQueue entries
+     * in that case and return without scheduling another KICK. Drain any
+     * such already-published CQ entries before admitting more requests.
+     */
+    SpdRingEnsureKickOutstanding(Runtime);
     SpdRingMaybeIssueWait(Runtime);
 }
 
