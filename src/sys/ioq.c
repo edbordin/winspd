@@ -52,6 +52,17 @@ VOID SpdIoqDelete(SPD_IOQ *Ioq)
     SpdFree(Ioq, SpdTagIoq);
 }
 
+VOID SpdIoqSetNonblockingConsumer(SPD_IOQ *Ioq)
+{
+    KIRQL Irql;
+
+    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+
+    Ioq->NonblockingConsumer = TRUE;
+
+    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+}
+
 static const char *SpdIoqResetReasonString(
     SPD_IOQ_RESET_REASON Reason)
 {
@@ -238,18 +249,15 @@ NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
     if (!Ioq->Stopped)
     {
         SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
-        PUCHAR Cdb = (PUCHAR)SrbGetCdb(Srb);
 
         ASSERT(0 == SrbExtension->Srb);
         SrbExtension->Srb = Srb;
 
         ASSERT(0 == SrbExtension->ListEntry.Flink && 0 == SrbExtension->ListEntry.Blink);
         InsertTailList(&Ioq->PendingList, &SrbExtension->ListEntry);
-        DbgPrint(DRIVER_NAME ": IOQ POST ext=%p srb=%p cdb=%02x\n",
-            SrbExtension, Srb, (unsigned)Cdb[0]);
 
-        /* queue is not empty; wake up a waiter */
-        SpdQeventSetNoLock(&Ioq->PendingEvent);
+        if (!Ioq->NonblockingConsumer)
+            SpdQeventSetNoLock(&Ioq->PendingEvent);
 
         Result = STATUS_SUCCESS;
     }
@@ -278,7 +286,6 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
 
     if (Ioq->Stopped)
     {
-        SpdQeventSetNoLock(&Ioq->PendingEvent);
         Result = STATUS_CANCELLED;
     }
     else if (IsListEmpty(&Ioq->PendingList))
@@ -291,7 +298,15 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
         BOOLEAN Wake;
         ULONG Index;
 
-        Wake = !RemoveEntryList(&SrbExtension->ListEntry);
+        if (Ioq->NonblockingConsumer)
+        {
+            RemoveEntryList(&SrbExtension->ListEntry);
+            Wake = FALSE;
+        }
+        else
+        {
+            Wake = !RemoveEntryList(&SrbExtension->ListEntry);
+        }
 
         Prepare(SrbExtension, Context, DataBuffer);
 
@@ -304,9 +319,6 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
 #endif
         SrbExtension->HashNext = Ioq->ProcessBuckets[Index];
         Ioq->ProcessBuckets[Index] = SrbExtension;
-        DbgPrint(DRIVER_NAME ": IOQ START ext=%p srb=%p pending-to-process bucket=%lu\n",
-            SrbExtension, SrbExtension->Srb, Index);
-
         if (Wake)
             SpdQeventSetNoLock(&Ioq->PendingEvent);
 
@@ -403,10 +415,6 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
             if (*P == SrbExtension)
             {
                 *P = SrbExtension->HashNext;
-                DbgPrint(DRIVER_NAME ": IOQ END hint=%p FOUND ext=%p srb=%p bucket=%lu\n",
-                    SrbExtension0, SrbExtension, SrbExtension->Srb,
-                    Index);
-
                 RemoveEntryList(&SrbExtension->ListEntry);
 
                 UCHAR SrbStatus = Complete(SrbExtension, Context, DataBuffer);

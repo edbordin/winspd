@@ -806,10 +806,7 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         SPD_RING_USER_ITEM *Item;
         SPD_IOCTL_TRANSACT_RSP Response;
         SPD_STORAGE_UNIT_OPERATION_CONTEXT OperationContext;
-        UINT64 ResponseHint;
-        UINT64 QueuedResponses = 0;
         BOOLEAN Complete;
-        BOOLEAN ResponseQueued = FALSE;
         BOOLEAN ProtocolError = FALSE;
         BOOLEAN NotifyError = FALSE;
 
@@ -840,7 +837,6 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
         Item->SendResponseActive = FALSE;
         Item->CallbackFinished = FALSE;
         Item->CallbackComplete = FALSE;
-        ResponseHint = Item->Message.Request.Hint;
         ReleaseSRWLockExclusive(&Runtime->CompletionLock);
 
         if (StorageUnit->DebugLog &&
@@ -873,8 +869,6 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
                 SpdRingActiveRemoveLocked(Item);
                 Item->State = SpdRingUserItemDoneQueued;
                 NotifyError = !SpdRingQueueDoneLocked(Runtime, Item);
-                ResponseQueued = TRUE;
-                QueuedResponses = Runtime->QueuedResponses;
             }
         }
         else if (Item->EarlyResponseValid)
@@ -884,17 +878,10 @@ static DWORD WINAPI SpdStorageUnitRingWorkerThread(PVOID Runtime0)
             SpdRingActiveRemoveLocked(Item);
             Item->State = SpdRingUserItemDoneQueued;
             NotifyError = !SpdRingQueueDoneLocked(Runtime, Item);
-            ResponseQueued = TRUE;
-            QueuedResponses = Runtime->QueuedResponses;
         }
         else
             Item->State = SpdRingUserItemDeferred;
         ReleaseSRWLockExclusive(&Runtime->CompletionLock);
-
-        if (ResponseQueued)
-            SpdDebugLog("SharedRing response queued tick=%I64u hint=%I64u "
-                "count=%I64u\n", GetTickCount64(), ResponseHint,
-                QueuedResponses);
 
         if (ProtocolError || NotifyError)
         {
@@ -966,7 +953,6 @@ static VOID SpdRingMaybeIssueWait(
 {
     if (InterlockedCompareExchange(&Runtime->Stopping, 0, 0) ||
         Runtime->WaitOutstanding ||
-        Runtime->KickOutstanding ||
         0 == Runtime->FreeItemCount)
         return;
 
@@ -995,9 +981,11 @@ static VOID SpdRingConsumeRequests(
     SPD_RING_HEADER *Header = Runtime->Header;
     SPD_RING_REQUEST *RequestRing = (SPD_RING_REQUEST *)
         ((PUINT8)Runtime->RingBase + Runtime->RequestOffset);
+    LIST_ENTRY NewWork;
     UINT32 Head = Runtime->RequestHead;
     UINT32 Tail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
     UINT32 Count = Tail - Head;
+    BOOLEAN InsertFailed = FALSE;
 
     if (Count > Runtime->QueueDepth ||
         Count != Runtime->WaitParams.Produced ||
@@ -1007,20 +995,37 @@ static VOID SpdRingConsumeRequests(
         return;
     }
 
+    if (Count > Runtime->FreeItemCount)
+    {
+        SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
+        return;
+    }
+
+    for (UINT32 i = 0; i < Count; i++)
+    {
+        SPD_RING_REQUEST *Entry = &RequestRing[
+            (Head + i) & (Runtime->QueueDepth - 1)];
+        PVOID DataBuffer;
+
+        if (!SpdRingValidateRequestData(Runtime, &Entry->Request,
+                &Entry->Data, &DataBuffer))
+        {
+            SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
+            return;
+        }
+    }
+
+    SpdRingListInitialize(&NewWork);
+    AcquireSRWLockExclusive(&Runtime->CompletionLock);
+
     while (Head != Tail)
     {
         SPD_RING_REQUEST Entry =
             RequestRing[Head & (Runtime->QueueDepth - 1)];
         SPD_RING_USER_ITEM *Item;
-        PVOID DataBuffer = 0;
-
-        if (Runtime->FreeItemCount == 0 ||
-            !SpdRingValidateRequestData(Runtime, &Entry.Request,
-                &Entry.Data, &DataBuffer))
-        {
-            SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
-            return;
-        }
+        PVOID DataBuffer = SpdRingBufferAddress(Runtime,
+            Entry.Data.BufferId, Entry.Data.Offset,
+            Entry.Data.Length);
 
         Item = CONTAINING_RECORD(
             SpdRingListRemoveHead(&Runtime->FreeItems),
@@ -1034,18 +1039,39 @@ static VOID SpdRingConsumeRequests(
         Item->CallbackFinished = FALSE;
         Item->CallbackComplete = FALSE;
 
-        AcquireSRWLockExclusive(&Runtime->CompletionLock);
         Item->State = SpdRingUserItemWorkQueued;
-        BOOLEAN Inserted = SpdRingActiveInsertLocked(Runtime, Item);
-        ReleaseSRWLockExclusive(&Runtime->CompletionLock);
-        if (!Inserted)
+        if (!SpdRingActiveInsertLocked(Runtime, Item))
         {
-            SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
-            return;
+            InsertFailed = TRUE;
+            break;
         }
 
-        SpdRingQueueWork(Runtime, Item);
+        SpdRingListInsertTail(&NewWork, &Item->QueueLink);
         Head++;
+    }
+
+    ReleaseSRWLockExclusive(&Runtime->CompletionLock);
+
+    if (InsertFailed)
+    {
+        SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
+        return;
+    }
+
+    if (!SpdRingListEmpty(&NewWork))
+    {
+        AcquireSRWLockExclusive(&Runtime->WorkLock);
+
+        while (!SpdRingListEmpty(&NewWork))
+        {
+            SpdRingListInsertTail(
+                &Runtime->WorkQueue,
+                SpdRingListRemoveHead(&NewWork));
+        }
+
+        WakeAllConditionVariable(&Runtime->WorkAvailable);
+
+        ReleaseSRWLockExclusive(&Runtime->WorkLock);
     }
 
     Runtime->RequestHead = Head;
@@ -1122,9 +1148,6 @@ static VOID SpdRingPublishCompletions(
 
     Runtime->CompletionTail = Tail;
     SpdRingStoreRelease32(&Header->CompletionTail.Value, Tail);
-    SpdDebugLog("SharedRing completions published tick=%I64u count=%lu "
-        "tail=%lu\n", GetTickCount64(), (unsigned long)Published,
-        (unsigned long)Tail);
     Runtime->CompletionBatches++;
     Runtime->CompletedRequests += Published;
     if (Published > Runtime->MaxCompletionBatch)
@@ -1135,13 +1158,13 @@ static VOID SpdRingPublishCompletions(
         SPD_RING_USER_ITEM *Item = CONTAINING_RECORD(
             SpdRingListRemoveHead(&LocalRecycle),
             SPD_RING_USER_ITEM, QueueLink);
-        AcquireSRWLockExclusive(&Runtime->CompletionLock);
+
         Item->State = SpdRingUserItemFree;
         Item->EarlyResponseValid = FALSE;
         Item->SendResponseActive = FALSE;
         Item->CallbackFinished = FALSE;
         Item->CallbackComplete = FALSE;
-        ReleaseSRWLockExclusive(&Runtime->CompletionLock);
+
         SpdRingListInsertTail(&Runtime->FreeItems, &Item->QueueLink);
         Runtime->FreeItemCount++;
     }
@@ -1183,13 +1206,6 @@ static VOID SpdRingHandleKickCompletion(
     DWORD Error)
 {
     Runtime->KickOutstanding = FALSE;
-    SpdDebugLog("SharedRing KICK completed tick=%I64u error=%lu "
-        "consumed=%lu head=%lu tail=%lu\n", GetTickCount64(),
-        (unsigned long)Error,
-        (unsigned long)Runtime->KickParams.Consumed,
-        (unsigned long)SpdRingLoadAcquire32(
-            &Runtime->Header->CompletionHead.Value),
-        (unsigned long)Runtime->CompletionTail);
     if (InterlockedCompareExchange(&Runtime->Stopping, 0, 0) &&
         ERROR_OPERATION_ABORTED == Error)
         return;

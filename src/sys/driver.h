@@ -324,6 +324,7 @@ typedef struct
     PVOID DeviceExtension;
     KSPIN_LOCK SpinLock;
     BOOLEAN Stopped;
+    BOOLEAN NonblockingConsumer;
     SPD_QEVENT PendingEvent;
     LIST_ENTRY PendingList, ProcessList;
     ULONG ProcessBucketCount;
@@ -344,6 +345,7 @@ typedef enum
 
 NTSTATUS SpdIoqCreate(PVOID DeviceExtension, SPD_IOQ **PIoq);
 VOID SpdIoqDelete(SPD_IOQ *Ioq);
+VOID SpdIoqSetNonblockingConsumer(SPD_IOQ *Ioq);
 VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason);
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);

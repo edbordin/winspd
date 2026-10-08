@@ -357,6 +357,8 @@ NTSTATUS SpdStorageUnitRingOpen(
     KeSetEvent(&Ring->IdleEvent, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
+    SpdIoqSetNonblockingConsumer(StorageUnit->Ioq);
+
     Params->UserAddress = (UINT64)(UINT_PTR)UserAddress;
     Params->SectionSize = SectionSize;
     Params->Features = 0;
