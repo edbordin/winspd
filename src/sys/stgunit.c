@@ -25,12 +25,21 @@ ERESOURCE SpdGlobalDeviceResource;
 SPD_DEVICE_EXTENSION *SpdGlobalDeviceExtension;
 ULONG SpdStorageUnitCapacity = SPD_IOCTL_STORAGE_UNIT_CAPACITY;
 
+#define SPD_RING_MAX_PRODUCER_BATCH 4
+
 static VOID SpdDeviceExtensionNotifyRoutine(HANDLE ParentId, HANDLE ProcessId0, BOOLEAN Create);
-static VOID SpdStorageUnitRingWaitDpc(
+static VOID SpdStorageUnitRingProducerDpc(
     PKDPC Dpc,
     PVOID DeferredContext,
     PVOID SystemArgument1,
     PVOID SystemArgument2);
+static BOOLEAN SpdStorageUnitRingEnter(SPD_STORAGE_UNIT *StorageUnit);
+static VOID SpdStorageUnitRingLeave(SPD_STORAGE_UNIT *StorageUnit);
+static VOID SpdStorageUnitRingCompleteWait(
+    SPD_STORAGE_UNIT *StorageUnit,
+    NTSTATUS Status,
+    BOOLEAN RequireRequest);
+static VOID SpdStorageUnitRingCancelWait(SPD_STORAGE_UNIT *StorageUnit);
 
 static BOOLEAN SpdRingSizeAdd(SIZE_T *PSize, SIZE_T Add)
 {
@@ -96,17 +105,15 @@ static VOID SpdStorageUnitRingReset(
     Ring->CompletionOffset = 0;
     Ring->BufferOffset = 0;
     Ring->QueueDepth = 0;
+    Ring->BufferCount = 0;
     Ring->BufferSize = 0;
     Ring->RequestTail = 0;
     Ring->CompletionHead = 0;
     Ring->ProcessId = 0;
     Ring->UserProcessId = 0;
-    Ring->WaitActive = FALSE;
-    Ring->WaitServicing = FALSE;
-    Ring->WaitServiceRequested = FALSE;
-    Ring->WaitIrp = 0;
-    Ring->WaitParams = 0;
-    Ring->KickActive = FALSE;
+    InterlockedExchangePointer(&Ring->WaitIrp, 0);
+    InterlockedExchange(&Ring->ProducerState, 0);
+    InterlockedExchange(&Ring->KickActive, 0);
     /* Close is terminal for this storage unit. */
     Ring->Stopping = TRUE;
 }
@@ -122,7 +129,7 @@ static BOOLEAN SpdRingBufferAllocLocked(
         return FALSE;
 
     Id = Pool->FreeIds[--Pool->FreeCount];
-    ASSERT(Id < Ring->QueueDepth);
+    ASSERT(Id < Ring->BufferCount);
     ASSERT(!Pool->Meta[Id].Allocated);
     Pool->Meta[Id].Allocated = TRUE;
     Pool->Meta[Id].OwnerHint = 0;
@@ -138,9 +145,9 @@ static VOID SpdRingBufferFreeLocked(
 {
     SPD_RING_BUFFER_POOL *Pool = &Ring->Buffers;
 
-    ASSERT(BufferId < Ring->QueueDepth);
+    ASSERT(BufferId < Ring->BufferCount);
     ASSERT(Pool->Meta[BufferId].Allocated);
-    ASSERT(Pool->FreeCount < Ring->QueueDepth);
+    ASSERT(Pool->FreeCount < Ring->BufferCount);
     Pool->Meta[BufferId].Allocated = FALSE;
     Pool->Meta[BufferId].OwnerHint = 0;
     Pool->Meta[BufferId].Length = 0;
@@ -156,7 +163,7 @@ static PVOID SpdRingBufferAddress(
 {
     SIZE_T BufferOffset;
 
-    if (BufferId >= Ring->QueueDepth ||
+    if (BufferId >= Ring->BufferCount ||
         Offset > Ring->BufferSize ||
         Length > Ring->BufferSize - Offset)
         return 0;
@@ -182,7 +189,7 @@ static VOID SpdStorageUnitRingMarkFailed(
     KeReleaseSpinLock(&Ring->Lock, Irql);
     SpdIoqReset(StorageUnit->Ioq, TRUE,
         SpdIoqResetReasonRingFailure);
-    SpdStorageUnitRingNotifyRequest(StorageUnit);
+    SpdStorageUnitRingCancelWait(StorageUnit);
 }
 
 NTSTATUS SpdStorageUnitRingOpen(
@@ -212,16 +219,21 @@ NTSTATUS SpdStorageUnitRingOpen(
 
     if (ProcessId != StorageUnit->TransactProcessId)
         return STATUS_ACCESS_DENIED;
-    if (SPD_RING_VERSION_3 != Params->Version)
+    if (SPD_RING_VERSION_4 != Params->Version)
         return STATUS_NOT_SUPPORTED;
-    if (0 != Params->Flags || 0 != Params->Reserved ||
+    if (0 != Params->Flags || 0 == Params->BufferCount ||
         !SpdRingQueueDepthValid(Params->QueueDepth) ||
         Params->BufferSize < StorageUnit->StorageUnitParams.MaxTransferLength)
         return STATUS_INVALID_PARAMETER;
 
-    if ((SIZE_T)-1 / Params->QueueDepth < Params->BufferSize)
+    if ((SIZE_T)-1 / Params->BufferCount < Params->BufferSize)
         return STATUS_INVALID_PARAMETER;
-    BufferBytes = (SIZE_T)Params->QueueDepth * Params->BufferSize;
+    if ((SIZE_T)Params->BufferCount >
+            (SIZE_T)-1 / sizeof(UINT32) ||
+        (SIZE_T)Params->BufferCount >
+            (SIZE_T)-1 / sizeof(SPD_RING_BUFFER_META))
+        return STATUS_INVALID_PARAMETER;
+    BufferBytes = (SIZE_T)Params->BufferCount * Params->BufferSize;
     RequestBytes = (SIZE_T)Params->QueueDepth * sizeof(SPD_RING_REQUEST);
     CompletionBytes = (SIZE_T)Params->QueueDepth * sizeof(SPD_RING_COMPLETION);
 
@@ -242,10 +254,10 @@ NTSTATUS SpdStorageUnitRingOpen(
         return STATUS_INVALID_PARAMETER;
 
     FreeIds = SpdAllocNonPaged(
-        (SIZE_T)Params->QueueDepth * sizeof *FreeIds,
+        (SIZE_T)Params->BufferCount * sizeof *FreeIds,
         SpdTagStorageUnit);
     Meta = SpdAllocNonPaged(
-        (SIZE_T)Params->QueueDepth * sizeof *Meta,
+        (SIZE_T)Params->BufferCount * sizeof *Meta,
         SpdTagStorageUnit);
     if (0 == FreeIds || 0 == Meta)
     {
@@ -253,8 +265,8 @@ NTSTATUS SpdStorageUnitRingOpen(
         goto exit;
     }
     RtlZeroMemory(Meta,
-        (SIZE_T)Params->QueueDepth * sizeof *Meta);
-    for (UINT32 I = 0; Params->QueueDepth > I; I++)
+        (SIZE_T)Params->BufferCount * sizeof *Meta);
+    for (UINT32 I = 0; Params->BufferCount > I; I++)
         FreeIds[I] = I;
 
     MaximumSize.QuadPart = (LONGLONG)SectionSize;
@@ -308,7 +320,7 @@ NTSTATUS SpdStorageUnitRingOpen(
 
     RtlZeroMemory(SystemAddress, SectionSize);
     Header = (SPD_RING_HEADER *)SystemAddress;
-    Header->Version = SPD_RING_VERSION_3;
+    Header->Version = SPD_RING_VERSION_4;
     Header->HeaderSize = sizeof *Header;
     Header->RequestOffset = (UINT32)SPD_IOCTL_ALIGN_UP(
         sizeof *Header, SPD_RING_CACHE_LINE_SIZE);
@@ -318,7 +330,7 @@ NTSTATUS SpdStorageUnitRingOpen(
     Header->BufferOffset = (UINT32)SPD_IOCTL_ALIGN_UP(
         Header->CompletionOffset + CompletionBytes, PAGE_SIZE);
     Header->QueueDepth = Params->QueueDepth;
-    Header->BufferCount = Params->QueueDepth;
+    Header->BufferCount = Params->BufferCount;
     Header->BufferSize = Params->BufferSize;
 
     KeAcquireSpinLock(&Ring->Lock, &Irql);
@@ -340,11 +352,12 @@ NTSTATUS SpdStorageUnitRingOpen(
     Ring->CompletionOffset = Header->CompletionOffset;
     Ring->BufferOffset = Header->BufferOffset;
     Ring->QueueDepth = Params->QueueDepth;
+    Ring->BufferCount = Params->BufferCount;
     Ring->BufferSize = Params->BufferSize;
     Ring->RequestTail = 0;
     Ring->CompletionHead = 0;
     Ring->Buffers.FreeIds = FreeIds;
-    Ring->Buffers.FreeCount = Params->QueueDepth;
+    Ring->Buffers.FreeCount = Params->BufferCount;
     Ring->Buffers.Meta = Meta;
     Ring->SectionHandle = SectionHandle;
     Ring->Mdl = Mdl;
@@ -352,8 +365,9 @@ NTSTATUS SpdStorageUnitRingOpen(
     Ring->ProcessId = ProcessId;
     Ring->UserProcessId = ProcessId;
     Ring->Failed = FALSE;
-    Ring->WaitActive = FALSE;
-    Ring->KickActive = FALSE;
+    InterlockedExchangePointer(&Ring->WaitIrp, 0);
+    InterlockedExchange(&Ring->ProducerState, 0);
+    InterlockedExchange(&Ring->KickActive, 0);
     KeSetEvent(&Ring->IdleEvent, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
@@ -422,9 +436,17 @@ VOID SpdStorageUnitRingClose(
 
     SpdIoqReset(StorageUnit->Ioq, TRUE,
         SpdIoqResetReasonRingClose);
-    SpdStorageUnitRingNotifyRequest(StorageUnit);
+    SpdStorageUnitRingCancelWait(StorageUnit);
     KeWaitForSingleObject(&Ring->IdleEvent,
         Executive, KernelMode, FALSE, NULL);
+    DbgPrint(DRIVER_NAME ": SharedRing close depth=%lu buffers=%lu "
+        "sq_full=%ld buffer_starved=%ld waits=%ld/%ld producer_runs=%ld "
+        "producer_reruns=%ld produced=%ld max_batch=%ld\n",
+        Ring->QueueDepth, Ring->BufferCount,
+        Ring->SqFullEvents, Ring->BufferPoolExhaustions,
+        Ring->WaitSubmissions, Ring->WaitCompletions,
+        Ring->ProducerDpcRuns, Ring->ProducerDpcReruns,
+        Ring->ProducerProduced, Ring->ProducerMaxBatch);
     SpdStorageUnitRingReset(StorageUnit, UserProcessExiting);
 }
 
@@ -450,7 +472,9 @@ NTSTATUS SpdStorageUnitRingStop(
     /* Keep the section mapped while userspace drains and joins its threads. */
     SpdIoqReset(StorageUnit->Ioq, TRUE,
         SpdIoqResetReasonRingStop);
-    SpdStorageUnitRingNotifyRequest(StorageUnit);
+    SpdStorageUnitRingCancelWait(StorageUnit);
+    KeWaitForSingleObject(&Ring->IdleEvent,
+        Executive, KernelMode, FALSE, NULL);
     return STATUS_SUCCESS;
 }
 
@@ -528,7 +552,266 @@ static BOOLEAN SpdRingGetRequestDataLength(
     return TRUE;
 }
 
-static VOID SpdStorageUnitRingWaitDpc(
+static VOID SpdRingFreeProducedBuffers(
+    SPD_RING_STATE *Ring,
+    SPD_RING_REQUEST *RequestRing,
+    UINT32 InitialTail,
+    UINT32 Produced)
+{
+    KIRQL Irql;
+
+    KeAcquireSpinLock(&Ring->Lock, &Irql);
+    for (UINT32 I = 0; Produced > I; I++)
+    {
+        SPD_RING_REQUEST *Entry = &RequestRing[
+            (InitialTail + I) & (Ring->QueueDepth - 1)];
+        if (SPD_RING_NO_BUFFER != Entry->Data.BufferId)
+            SpdRingBufferFreeLocked(Ring, Entry->Data.BufferId);
+    }
+    KeReleaseSpinLock(&Ring->Lock, Irql);
+}
+
+static UINT32 SpdRingProduceBatch(
+    SPD_STORAGE_UNIT *StorageUnit,
+    BOOLEAN *PBatchLimitReached)
+{
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    SPD_RING_HEADER *Header = (SPD_RING_HEADER *)Ring->SystemAddress;
+    SPD_RING_REQUEST *RequestRing = (SPD_RING_REQUEST *)
+        ((PUINT8)Ring->SystemAddress + Ring->RequestOffset);
+    UINT32 Head = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+    UINT32 Tail = Ring->RequestTail;
+    UINT32 Used = Tail - Head;
+    UINT32 Free;
+    UINT32 Budget;
+    UINT32 Produced = 0;
+    UINT32 InitialTail = Tail;
+    BOOLEAN Failed = FALSE;
+    BOOLEAN Cancelled = FALSE;
+    KIRQL Irql;
+
+    *PBatchLimitReached = FALSE;
+    if (Used > Ring->QueueDepth)
+    {
+        SpdStorageUnitRingMarkFailed(StorageUnit);
+        return 0;
+    }
+    Free = Ring->QueueDepth - Used;
+    if (0 == Free)
+    {
+        InterlockedIncrement(&Ring->SqFullEvents);
+        return 0;
+    }
+    Budget = min(Free, SPD_RING_MAX_PRODUCER_BATCH);
+
+    while (Produced != Budget)
+    {
+        UINT32 BufferId;
+        PVOID DataBuffer;
+        SPD_IOCTL_TRANSACT_REQ Request;
+        NTSTATUS StartResult;
+        UINT32 DataLength;
+        BOOLEAN NeedsBuffer;
+        SPD_RING_BUFFER_REF Data;
+        SPD_RING_REQUEST *Entry;
+
+        KeAcquireSpinLock(&Ring->Lock, &Irql);
+        if (Ring->Stopping || Ring->Failed)
+        {
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            Cancelled = TRUE;
+            break;
+        }
+        if (!SpdRingBufferAllocLocked(Ring, &BufferId))
+        {
+            InterlockedIncrement(&Ring->BufferPoolExhaustions);
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            break;
+        }
+        KeReleaseSpinLock(&Ring->Lock, Irql);
+
+        DataBuffer = SpdRingBufferAddress(Ring, BufferId, 0,
+            Ring->BufferSize);
+        if (0 == DataBuffer)
+        {
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            SpdRingBufferFreeLocked(Ring, BufferId);
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            Failed = TRUE;
+            break;
+        }
+
+        RtlZeroMemory(&Request, sizeof Request);
+        StartResult = SpdIoqTryStartProcessingSrb(StorageUnit->Ioq,
+            SpdSrbExecuteScsiPrepare, &Request, DataBuffer);
+        if (STATUS_NOT_FOUND == StartResult)
+        {
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            SpdRingBufferFreeLocked(Ring, BufferId);
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            break;
+        }
+        if (!NT_SUCCESS(StartResult))
+        {
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            SpdRingBufferFreeLocked(Ring, BufferId);
+            if (STATUS_CANCELLED == StartResult)
+                Ring->Stopping = TRUE;
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            Cancelled = STATUS_CANCELLED == StartResult;
+            Failed = !Cancelled;
+            break;
+        }
+
+        if (0 == Request.Hint ||
+            !SpdRingGetRequestDataLength(StorageUnit, &Request,
+                &DataLength, &NeedsBuffer))
+        {
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            SpdRingBufferFreeLocked(Ring, BufferId);
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            Failed = TRUE;
+            break;
+        }
+
+        if (NeedsBuffer)
+        {
+            Data.BufferId = BufferId;
+            Data.Offset = 0;
+            Data.Length = DataLength;
+            Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            ASSERT(Ring->Buffers.Meta[BufferId].Allocated);
+            Ring->Buffers.Meta[BufferId].OwnerHint = Request.Hint;
+            Ring->Buffers.Meta[BufferId].Length = DataLength;
+            Ring->Buffers.Meta[BufferId].Kind = Request.Kind;
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+        }
+        else
+        {
+            /* FLUSH is bufferless but still follows the normal reservation
+             * path so every SRB starts from the same resource check. */
+            KeAcquireSpinLock(&Ring->Lock, &Irql);
+            SpdRingBufferFreeLocked(Ring, BufferId);
+            KeReleaseSpinLock(&Ring->Lock, Irql);
+            Data.BufferId = SPD_RING_NO_BUFFER;
+            Data.Offset = 0;
+            Data.Length = 0;
+            Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
+        }
+
+        Entry = &RequestRing[Tail & (Ring->QueueDepth - 1)];
+        Entry->Request = Request;
+        Entry->Data = Data;
+        Tail++;
+        Produced++;
+    }
+
+    if (Failed)
+    {
+        SpdRingFreeProducedBuffers(Ring, RequestRing,
+            InitialTail, Produced);
+        SpdStorageUnitRingMarkFailed(StorageUnit);
+        return 0;
+    }
+    if (Cancelled)
+    {
+        SpdRingFreeProducedBuffers(Ring, RequestRing,
+            InitialTail, Produced);
+        SpdIoqReset(StorageUnit->Ioq, TRUE,
+            SpdIoqResetReasonRingStop);
+        SpdStorageUnitRingCancelWait(StorageUnit);
+        return 0;
+    }
+
+    KeAcquireSpinLock(&Ring->Lock, &Irql);
+    if (Ring->Stopping || Ring->Failed)
+    {
+        KeReleaseSpinLock(&Ring->Lock, Irql);
+        SpdRingFreeProducedBuffers(Ring, RequestRing,
+            InitialTail, Produced);
+        return 0;
+    }
+    if (0 != Produced)
+    {
+        Ring->RequestTail = Tail;
+        SpdRingStoreRelease32(&Header->RequestTail.Value, Tail);
+    }
+    KeReleaseSpinLock(&Ring->Lock, Irql);
+
+    if (0 != Produced)
+    {
+        InterlockedExchangeAdd(&Ring->ProducerProduced, (LONG)Produced);
+        for (;;)
+        {
+            LONG MaxBatch = InterlockedCompareExchange(
+                &Ring->ProducerMaxBatch, 0, 0);
+            if ((LONG)Produced <= MaxBatch ||
+                MaxBatch == InterlockedCompareExchange(
+                    &Ring->ProducerMaxBatch, (LONG)Produced, MaxBatch))
+                break;
+        }
+    }
+
+    if (Produced == Budget && Budget == SPD_RING_MAX_PRODUCER_BATCH &&
+        Free > Budget)
+        *PBatchLimitReached = TRUE;
+
+    return Produced;
+}
+
+static VOID SpdStorageUnitRingCompleteWait(
+    SPD_STORAGE_UNIT *StorageUnit,
+    NTSTATUS Status,
+    BOOLEAN RequireRequest)
+{
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    SPD_DEVICE_EXTENSION *DeviceExtension =
+        StorageUnit->Ioq->DeviceExtension;
+    KIRQL Irql;
+    BOOLEAN Stopping;
+
+    KeAcquireSpinLock(&Ring->Lock, &Irql);
+    Stopping = Ring->Stopping || Ring->Failed;
+    KeReleaseSpinLock(&Ring->Lock, Irql);
+    if (Stopping)
+        Status = STATUS_CANCELLED;
+    else if (RequireRequest)
+    {
+        SPD_RING_HEADER *Header = (SPD_RING_HEADER *)Ring->SystemAddress;
+        UINT32 Head = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+        UINT32 Tail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+        UINT32 Available = Tail - Head;
+        if (Available > Ring->QueueDepth)
+        {
+            SpdStorageUnitRingMarkFailed(StorageUnit);
+            Status = STATUS_INVALID_PARAMETER;
+        }
+        else if (0 == Available)
+            return;
+        else
+            Status = STATUS_SUCCESS;
+    }
+
+    PIRP Irp = InterlockedExchangePointer(&Ring->WaitIrp, 0);
+    if (0 == Irp)
+        return;
+
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = NT_SUCCESS(Status) ?
+        sizeof(SPD_IOCTL_RING_WAIT_PARAMS) : 0;
+    InterlockedIncrement(&Ring->WaitCompletions);
+    StorPortCompleteServiceIrp(DeviceExtension, Irp);
+    SpdStorageUnitRingLeave(StorageUnit);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+static VOID SpdStorageUnitRingCancelWait(SPD_STORAGE_UNIT *StorageUnit)
+{
+    SpdStorageUnitRingCompleteWait(StorageUnit, STATUS_CANCELLED, FALSE);
+}
+
+static VOID SpdStorageUnitRingProducerDpc(
     PKDPC Dpc,
     PVOID DeferredContext,
     PVOID SystemArgument1,
@@ -540,289 +823,121 @@ static VOID SpdStorageUnitRingWaitDpc(
 
     SPD_STORAGE_UNIT *StorageUnit = DeferredContext;
     SPD_RING_STATE *Ring = &StorageUnit->Ring;
-    SPD_DEVICE_EXTENSION *DeviceExtension = StorageUnit->Ioq->DeviceExtension;
-    SPD_RING_HEADER *Header;
-    SPD_RING_REQUEST *RequestRing;
-    PIRP Irp;
-    SPD_IOCTL_RING_WAIT_PARAMS *Params;
-    UINT32 Head;
-    UINT32 Tail;
-    UINT32 Count;
-    UINT32 Available;
-    UINT32 Budget;
-    UINT32 Produced;
-    UINT32 InitialTail;
-    NTSTATUS Result;
-    BOOLEAN Failed;
-    BOOLEAN Stopping;
-    KIRQL Irql;
+    SPD_DEVICE_EXTENSION *DeviceExtension =
+        StorageUnit->Ioq->DeviceExtension;
 
     ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
+    InterlockedIncrement(&Ring->ProducerDpcRuns);
+
+    BOOLEAN BatchLimitReached = FALSE;
+    KIRQL Irql;
+    BOOLEAN Stopping;
+
+    KeAcquireSpinLock(&Ring->Lock, &Irql);
+    Stopping = Ring->Stopping || Ring->Failed;
+    KeReleaseSpinLock(&Ring->Lock, Irql);
+
+    if (!Stopping)
+        SpdRingProduceBatch(StorageUnit, &BatchLimitReached);
+    SpdStorageUnitRingCompleteWait(
+        StorageUnit, STATUS_SUCCESS, TRUE);
+
+    if (Stopping)
+    {
+        InterlockedExchange(&Ring->ProducerState, 0);
+        goto exit;
+    }
+
+    if (BatchLimitReached &&
+        1 == InterlockedCompareExchange(&Ring->ProducerState, 2, 1))
+        InterlockedIncrement(&Ring->ProducerDpcReruns);
 
     for (;;)
     {
-        KeAcquireSpinLock(&Ring->Lock, &Irql);
-        if (0 == Ring->WaitIrp || !Ring->WaitActive)
+        LONG State = InterlockedCompareExchange(
+            &Ring->ProducerState, 0, 1);
+        if (1 == State)
+            goto exit;
+        if (2 == State)
         {
-            Ring->WaitServicing = FALSE;
-            Ring->WaitServiceRequested = FALSE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
+            if (2 != InterlockedCompareExchange(
+                    &Ring->ProducerState, 1, 2))
+                continue;
+
+            /* Transfer this execution's lifetime reference to the queued
+             * continuation. FALSE means another queued invocation already
+             * owns its own reference; release this invocation's reference. */
+            if (KeInsertQueueDpc(&Ring->ProducerDpc, 0, 0))
+                return;
+            goto exit;
+        }
+
+        /* A scheduler observed the idle transition and queued a fresh DPC. */
+        goto exit;
+    }
+
+exit:
+    SpdStorageUnitRingLeave(StorageUnit);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+
+VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit)
+{
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    SPD_DEVICE_EXTENSION *DeviceExtension =
+        StorageUnit->Ioq->DeviceExtension;
+    SPD_STORAGE_UNIT *Reference;
+
+    Reference = SpdStorageUnitReferenceByBtl(DeviceExtension,
+        StorageUnit->Btl);
+    if (Reference != StorageUnit)
+    {
+        if (0 != Reference)
+            SpdStorageUnitDereference(DeviceExtension, Reference);
+        return;
+    }
+    if (!SpdStorageUnitRingEnter(StorageUnit))
+    {
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+        return;
+    }
+
+    for (;;)
+    {
+        LONG State = InterlockedCompareExchange(
+            &Ring->ProducerState, 1, 0);
+        if (0 == State)
+        {
+            if (KeInsertQueueDpc(&Ring->ProducerDpc, 0, 0))
+                return;
+
+            /* FALSE means this KDPC is already queued. That queued/running
+             * instance owns its own rundown reference; request another pass
+             * and release this scheduler's temporary references. */
+            if (1 == InterlockedCompareExchange(
+                    &Ring->ProducerState, 2, 1))
+                InterlockedIncrement(&Ring->ProducerDpcReruns);
+            SpdStorageUnitRingLeave(StorageUnit);
+            SpdStorageUnitDereference(DeviceExtension, StorageUnit);
             return;
         }
-
-        Irp = Ring->WaitIrp;
-        Params = Ring->WaitParams;
-        Stopping = Ring->Stopping || Ring->Failed;
-        Ring->WaitServiceRequested = FALSE;
-        KeReleaseSpinLock(&Ring->Lock, Irql);
-
-        if (Stopping)
+        if (1 == State)
         {
-            Result = STATUS_CANCELLED;
-            Produced = 0;
-            goto complete_wait;
-        }
-
-        Header = (SPD_RING_HEADER *)Ring->SystemAddress;
-        RequestRing = (SPD_RING_REQUEST *)
-            ((PUINT8)Ring->SystemAddress + Ring->RequestOffset);
-        Head = SpdRingLoadAcquire32(&Header->RequestHead.Value);
-        Tail = Ring->RequestTail;
-        InitialTail = Tail;
-        Count = Tail - Head;
-        Produced = 0;
-        Failed = Count > Ring->QueueDepth;
-        Result = Failed ? STATUS_INVALID_PARAMETER : STATUS_SUCCESS;
-        Available = Failed ? 0 : Ring->QueueDepth - Count;
-        Budget = min(Params->MaxRequests, Available);
-
-        while (!Failed && Produced < Budget)
-        {
-            UINT32 BufferId;
-            PVOID DataBuffer;
-            SPD_IOCTL_TRANSACT_REQ Request;
-            NTSTATUS StartResult;
-            UINT32 DataLength;
-            BOOLEAN NeedsBuffer;
-            SPD_RING_BUFFER_REF Data;
-            SPD_RING_REQUEST *Entry;
-
-            KeAcquireSpinLock(&Ring->Lock, &Irql);
-            if (!SpdRingBufferAllocLocked(Ring, &BufferId))
+            if (1 == InterlockedCompareExchange(
+                    &Ring->ProducerState, 2, 1))
             {
-                Params->Flags |= SPD_RING_WAIT_FLAG_BUFFER_STARVED;
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                break;
+                InterlockedIncrement(&Ring->ProducerDpcReruns);
+                SpdStorageUnitRingLeave(StorageUnit);
+                SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+                return;
             }
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-
-            DataBuffer = SpdRingBufferAddress(Ring, BufferId, 0,
-                Ring->BufferSize);
-            if (0 == DataBuffer)
-            {
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                SpdRingBufferFreeLocked(Ring, BufferId);
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                Failed = TRUE;
-                Result = STATUS_INVALID_PARAMETER;
-                break;
-            }
-
-            RtlZeroMemory(&Request, sizeof Request);
-            StartResult = SpdIoqTryStartProcessingSrb(StorageUnit->Ioq,
-                SpdSrbExecuteScsiPrepare, &Request, DataBuffer);
-            if (STATUS_NOT_FOUND == StartResult)
-            {
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                SpdRingBufferFreeLocked(Ring, BufferId);
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                break;
-            }
-            if (!NT_SUCCESS(StartResult))
-            {
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                SpdRingBufferFreeLocked(Ring, BufferId);
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                Result = STATUS_CANCELLED == StartResult ?
-                    STATUS_CANCELLED : StartResult;
-                Failed = STATUS_CANCELLED != StartResult;
-                break;
-            }
-
-            if (0 == Request.Hint ||
-                !SpdRingGetRequestDataLength(StorageUnit, &Request,
-                    &DataLength, &NeedsBuffer))
-            {
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                SpdRingBufferFreeLocked(Ring, BufferId);
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                Failed = TRUE;
-                Result = STATUS_INVALID_PARAMETER;
-                break;
-            }
-
-            if (NeedsBuffer)
-            {
-                Data.BufferId = BufferId;
-                Data.Offset = 0;
-                Data.Length = DataLength;
-                Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                ASSERT(Ring->Buffers.Meta[BufferId].Allocated);
-                Ring->Buffers.Meta[BufferId].OwnerHint = Request.Hint;
-                Ring->Buffers.Meta[BufferId].Length = DataLength;
-                Ring->Buffers.Meta[BufferId].Kind = Request.Kind;
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-            }
-            else
-            {
-                KeAcquireSpinLock(&Ring->Lock, &Irql);
-                SpdRingBufferFreeLocked(Ring, BufferId);
-                KeReleaseSpinLock(&Ring->Lock, Irql);
-                Data.BufferId = SPD_RING_NO_BUFFER;
-                Data.Offset = 0;
-                Data.Length = 0;
-                Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
-            }
-
-            Entry = &RequestRing[Tail & (Ring->QueueDepth - 1)];
-            Entry->Request = Request;
-            Entry->Data = Data;
-            Tail++;
-            Produced++;
-        }
-
-        if (STATUS_CANCELLED == Result)
-        {
-            KeAcquireSpinLock(&Ring->Lock, &Irql);
-            for (UINT32 I = 0; Produced > I; I++)
-            {
-                SPD_RING_REQUEST *Entry = &RequestRing[
-                    (InitialTail + I) & (Ring->QueueDepth - 1)];
-                if (SPD_RING_NO_BUFFER != Entry->Data.BufferId)
-                    SpdRingBufferFreeLocked(Ring, Entry->Data.BufferId);
-            }
-            Ring->Stopping = TRUE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-            SpdIoqReset(StorageUnit->Ioq, TRUE,
-                SpdIoqResetReasonRingStop);
-            Produced = 0;
-            goto complete_wait;
-        }
-
-        if (Failed)
-        {
-            KeAcquireSpinLock(&Ring->Lock, &Irql);
-            for (UINT32 I = 0; Produced > I; I++)
-            {
-                SPD_RING_REQUEST *Entry = &RequestRing[
-                    (InitialTail + I) & (Ring->QueueDepth - 1)];
-                if (SPD_RING_NO_BUFFER != Entry->Data.BufferId)
-                    SpdRingBufferFreeLocked(Ring, Entry->Data.BufferId);
-            }
-            Ring->Failed = TRUE;
-            Ring->Stopping = TRUE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-            SpdIoqReset(StorageUnit->Ioq, TRUE,
-                SpdIoqResetReasonRingFailure);
-            Produced = 0;
-            goto complete_wait;
-        }
-
-        KeAcquireSpinLock(&Ring->Lock, &Irql);
-        Stopping = Ring->Stopping || Ring->Failed;
-        if (Stopping)
-        {
-            for (UINT32 I = 0; Produced > I; I++)
-            {
-                SPD_RING_REQUEST *Entry = &RequestRing[
-                    (InitialTail + I) & (Ring->QueueDepth - 1)];
-                if (SPD_RING_NO_BUFFER != Entry->Data.BufferId)
-                    SpdRingBufferFreeLocked(Ring, Entry->Data.BufferId);
-            }
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-            Result = STATUS_CANCELLED;
-            Produced = 0;
-            goto complete_wait;
-        }
-
-        if (0 != Produced)
-        {
-            Ring->RequestTail = Tail;
-            SpdRingStoreRelease32(&Header->RequestTail.Value, Tail);
-            Params->Produced = Produced;
-            Irp->IoStatus.Status = STATUS_SUCCESS;
-            Irp->IoStatus.Information = sizeof *Params;
-            Ring->WaitIrp = 0;
-            Ring->WaitParams = 0;
-            Ring->WaitActive = FALSE;
-            Ring->WaitServicing = FALSE;
-            Ring->WaitServiceRequested = FALSE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-            goto complete_detached;
-        }
-
-        if (Ring->WaitServiceRequested)
-        {
-            Ring->WaitServiceRequested = FALSE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
             continue;
         }
 
-        Ring->WaitServicing = FALSE;
-        KeReleaseSpinLock(&Ring->Lock, Irql);
-        return;
-
-complete_wait:
-        KeAcquireSpinLock(&Ring->Lock, &Irql);
-        if (Ring->WaitIrp != Irp)
-        {
-            Ring->WaitServicing = FALSE;
-            KeReleaseSpinLock(&Ring->Lock, Irql);
-            return;
-        }
-        Params->Produced = Produced;
-        Irp->IoStatus.Status = Result;
-        Irp->IoStatus.Information = NT_SUCCESS(Result) ? sizeof *Params : 0;
-        Ring->WaitIrp = 0;
-        Ring->WaitParams = 0;
-        Ring->WaitActive = FALSE;
-        Ring->WaitServicing = FALSE;
-        Ring->WaitServiceRequested = FALSE;
-        KeReleaseSpinLock(&Ring->Lock, Irql);
-
-complete_detached:
-        StorPortCompleteServiceIrp(DeviceExtension, Irp);
         SpdStorageUnitRingLeave(StorageUnit);
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
         return;
     }
-}
-
-VOID SpdStorageUnitRingNotifyRequest(SPD_STORAGE_UNIT *StorageUnit)
-{
-    SPD_RING_STATE *Ring;
-    KIRQL Irql;
-    BOOLEAN QueueDpc = FALSE;
-
-    if (0 == StorageUnit)
-        return;
-
-    Ring = &StorageUnit->Ring;
-    KeAcquireSpinLock(&Ring->Lock, &Irql);
-    if (Ring->WaitActive && 0 != Ring->WaitIrp)
-    {
-        Ring->WaitServiceRequested = TRUE;
-        if (!Ring->WaitServicing)
-        {
-            Ring->WaitServicing = TRUE;
-            QueueDpc = TRUE;
-        }
-    }
-    KeReleaseSpinLock(&Ring->Lock, Irql);
-
-    if (QueueDpc)
-        KeInsertQueueDpc(&Ring->WaitDpc, 0, 0);
 }
 
 SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
@@ -832,10 +947,10 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
     PIRP Irp)
 {
     SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    SPD_DEVICE_EXTENSION *DeviceExtension =
+        StorageUnit->Ioq->DeviceExtension;
     KIRQL Irql;
 
-    Params->Produced = 0;
-    Params->Flags = 0;
     Irp->IoStatus.Information = 0;
 
     if (ProcessId != StorageUnit->TransactProcessId)
@@ -843,36 +958,55 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
         Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
         return SpdServiceIrpCompleteNow;
     }
-    if (0 == Params->MaxRequests ||
-        Params->MaxRequests > Ring->QueueDepth)
+    for (UINT32 I = 0; ARRAYSIZE(Params->Reserved) > I; I++)
+        if (0 != Params->Reserved[I])
+        {
+            Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+            return SpdServiceIrpCompleteNow;
+        }
+
+    /* Protect the handler's short registration tail separately from the
+     * reference transferred to the retained WAIT IRP. */
+    KeAcquireSpinLock(&DeviceExtension->SpinLock, &Irql);
+    StorageUnit->RefCount++;
+    KeReleaseSpinLock(&DeviceExtension->SpinLock, Irql);
+
+    if (!SpdStorageUnitRingEnter(StorageUnit))
     {
-        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_STATE;
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
         return SpdServiceIrpCompleteNow;
     }
     if (!SpdStorageUnitRingEnter(StorageUnit))
     {
+        SpdStorageUnitRingLeave(StorageUnit);
         Irp->IoStatus.Status = STATUS_INVALID_DEVICE_STATE;
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
         return SpdServiceIrpCompleteNow;
     }
 
-    KeAcquireSpinLock(&Ring->Lock, &Irql);
-    if (Ring->WaitActive)
+    if (0 != InterlockedCompareExchangePointer(
+            &Ring->WaitIrp, Irp, 0))
     {
-        KeReleaseSpinLock(&Ring->Lock, Irql);
+        SpdStorageUnitRingLeave(StorageUnit);
         SpdStorageUnitRingLeave(StorageUnit);
         Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
+        SpdStorageUnitDereference(DeviceExtension, StorageUnit);
         return SpdServiceIrpCompleteNow;
     }
 
-    Ring->WaitActive = TRUE;
-    Ring->WaitServicing = FALSE;
-    Ring->WaitServiceRequested = FALSE;
-    Ring->WaitIrp = Irp;
-    Ring->WaitParams = Params;
-    KeReleaseSpinLock(&Ring->Lock, Irql);
+    InterlockedIncrement(&Ring->WaitSubmissions);
+    SpdStorageUnitRingScheduleProducer(StorageUnit);
 
-    /* Publish the IRP before probing the IOQ to close the lost-wakeup race. */
-    SpdStorageUnitRingNotifyRequest(StorageUnit);
+    /* STOP may have won after RingEnter but before waiter installation. */
+    KeAcquireSpinLock(&Ring->Lock, &Irql);
+    BOOLEAN Stopping = Ring->Stopping || Ring->Failed;
+    KeReleaseSpinLock(&Ring->Lock, Irql);
+    if (Stopping)
+        SpdStorageUnitRingCancelWait(StorageUnit);
+
+    SpdStorageUnitRingLeave(StorageUnit);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
     return SpdServiceIrpDeferred;
 }
 
@@ -887,7 +1021,7 @@ VOID SpdStorageUnitRingStopForRemoval(SPD_STORAGE_UNIT *StorageUnit)
 
     SpdIoqReset(StorageUnit->Ioq, TRUE,
         SpdIoqResetReasonRemoval);
-    SpdStorageUnitRingNotifyRequest(StorageUnit);
+    SpdStorageUnitRingCancelWait(StorageUnit);
     KeWaitForSingleObject(&Ring->IdleEvent,
         Executive, KernelMode, FALSE, NULL);
 }
@@ -914,16 +1048,11 @@ NTSTATUS SpdStorageUnitRingKick(
     if (!SpdStorageUnitRingEnter(StorageUnit))
         return STATUS_INVALID_DEVICE_STATE;
 
-    KeAcquireSpinLock(&Ring->Lock, &Irql);
-    if (Ring->KickActive)
+    if (0 != InterlockedCompareExchange(&Ring->KickActive, 1, 0))
     {
-        KeReleaseSpinLock(&Ring->Lock, Irql);
-        SpdStorageUnitRingMarkFailed(StorageUnit);
         SpdStorageUnitRingLeave(StorageUnit);
         return STATUS_DEVICE_BUSY;
     }
-    Ring->KickActive = TRUE;
-    KeReleaseSpinLock(&Ring->Lock, Irql);
 
     Header = (SPD_RING_HEADER *)Ring->SystemAddress;
     CompletionRing = (SPD_RING_COMPLETION *)
@@ -951,7 +1080,7 @@ NTSTATUS SpdStorageUnitRingKick(
         {
             SPD_RING_BUFFER_META Meta;
 
-            if (BufferId >= Ring->QueueDepth ||
+            if (BufferId >= Ring->BufferCount ||
                 0 != Data->Offset ||
                 SPD_RING_BUFFER_FLAG_NONE != Data->Flags ||
                 Data->Length > Ring->BufferSize)
@@ -1024,19 +1153,22 @@ exit:
         SpdRingStoreRelease32(&Header->CompletionHead.Value, Head);
     }
     Params->Consumed = Consumed;
-    KeAcquireSpinLock(&Ring->Lock, &Irql);
     if (Failed)
     {
+        KeAcquireSpinLock(&Ring->Lock, &Irql);
         Ring->Failed = TRUE;
         Ring->Stopping = TRUE;
+        KeReleaseSpinLock(&Ring->Lock, Irql);
     }
-    Ring->KickActive = FALSE;
-    KeReleaseSpinLock(&Ring->Lock, Irql);
+    InterlockedExchange(&Ring->KickActive, 0);
     if (Failed)
+    {
         SpdIoqReset(StorageUnit->Ioq, TRUE,
             SpdIoqResetReasonRingFailure);
-    if (0 != Consumed || Failed)
-        SpdStorageUnitRingNotifyRequest(StorageUnit);
+        SpdStorageUnitRingCancelWait(StorageUnit);
+    }
+    else
+        SpdStorageUnitRingScheduleProducer(StorageUnit);
     SpdStorageUnitRingLeave(StorageUnit);
     return Result;
 }
@@ -1167,11 +1299,12 @@ NTSTATUS SpdStorageUnitProvision(
 
     RtlZeroMemory(StorageUnit, sizeof *StorageUnit);
     KeInitializeSpinLock(&StorageUnit->Ring.Lock);
-    KeInitializeDpc(&StorageUnit->Ring.WaitDpc,
-        SpdStorageUnitRingWaitDpc, StorageUnit);
+    KeInitializeDpc(&StorageUnit->Ring.ProducerDpc,
+        SpdStorageUnitRingProducerDpc, StorageUnit);
     KeInitializeEvent(&StorageUnit->Ring.IdleEvent,
         NotificationEvent, TRUE);
     StorageUnit->RefCount = 1;
+    StorageUnit->Btl = (UINT32)-1;
     RtlCopyMemory(&StorageUnit->StorageUnitParams, StorageUnitParams,
         sizeof *StorageUnitParams);
     /* "left align" ProductId except that we allow all-NUL for testing */
@@ -1237,6 +1370,7 @@ NTSTATUS SpdStorageUnitProvision(
     }
     if (0 == DuplicateUnit && -1 != Btl)
     {
+        StorageUnit->Btl = Btl;
         DeviceExtension->StorageUnits[SPD_INDEX_FROM_BTL(Btl)] = StorageUnit;
         DeviceExtension->StorageUnitCount++;
     }

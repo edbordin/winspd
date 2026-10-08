@@ -211,6 +211,19 @@ static UCHAR SpdScsiInquiry(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUnit
 
         SrbSetDataTransferLength(Srb, INQUIRYDATABUFFERSIZE);
 
+        UCHAR PathId, TargetId, Lun;
+        SrbGetPathTargetLun(Srb, &PathId, &TargetId, &Lun);
+        if (!StorPortSetDeviceQueueDepth(DeviceExtension,
+                PathId, TargetId, Lun,
+                SPD_RING_DEFAULT_LUN_QUEUE_DEPTH))
+        {
+            DbgPrint(DRIVER_NAME ": StorPortSetDeviceQueueDepth failed "
+                "for %u:%u:%u depth=%u\n",
+                PathId, TargetId, Lun,
+                SPD_RING_DEFAULT_LUN_QUEUE_DEPTH);
+            return SRB_STATUS_INTERNAL_ERROR;
+        }
+
         return SRB_STATUS_SUCCESS;
     }
     else

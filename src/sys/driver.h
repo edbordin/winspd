@@ -401,23 +401,29 @@ typedef struct
     UINT32 CompletionOffset;
     UINT32 BufferOffset;
     UINT32 QueueDepth;
+    UINT32 BufferCount;
     UINT32 BufferSize;
     UINT32 RequestTail;
     UINT32 CompletionHead;
     SPD_RING_BUFFER_POOL Buffers;
     KSPIN_LOCK Lock;
-    BOOLEAN WaitActive;
-    BOOLEAN WaitServicing;
-    BOOLEAN WaitServiceRequested;
-    PIRP WaitIrp;
-    SPD_IOCTL_RING_WAIT_PARAMS *WaitParams;
-    KDPC WaitDpc;
-    BOOLEAN KickActive;
+    PVOID volatile WaitIrp;
+    KDPC ProducerDpc;
+    volatile LONG ProducerState;
+    volatile LONG KickActive;
     BOOLEAN Stopping;
     BOOLEAN Failed;
     ULONG ActiveCalls;
     KEVENT IdleEvent;
     ULONG ProcessId;
+    volatile LONG SqFullEvents;
+    volatile LONG BufferPoolExhaustions;
+    volatile LONG WaitSubmissions;
+    volatile LONG WaitCompletions;
+    volatile LONG ProducerDpcRuns;
+    volatile LONG ProducerDpcReruns;
+    volatile LONG ProducerProduced;
+    volatile LONG ProducerMaxBatch;
 
     /* Ring lifetime and mapping state. */
     HANDLE SectionHandle;
@@ -449,6 +455,7 @@ typedef struct _SPD_STORAGE_UNIT
     SPD_IOCTL_STORAGE_UNIT_PARAMS StorageUnitParams;
     CHAR SerialNumber[36];
     ULONG OwnerProcessId;
+    UINT32 Btl;
     SPD_IOQ *Ioq;
     /* fields not protected */
     PDEVICE_OBJECT DeviceObject;        /* disk device */
@@ -483,7 +490,7 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
     ULONG ProcessId,
     SPD_IOCTL_RING_WAIT_PARAMS *Params,
     PIRP Irp);
-VOID SpdStorageUnitRingNotifyRequest(SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit);
 VOID SpdStorageUnitRingStopForRemoval(SPD_STORAGE_UNIT *StorageUnit);
 NTSTATUS SpdStorageUnitRingKick(
     SPD_STORAGE_UNIT *StorageUnit,

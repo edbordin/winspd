@@ -43,9 +43,16 @@ ULONG SpdHwFindAdapter(
         ConfigInfo->NumberOfBuses = 1;
         ConfigInfo->ScatterGather = TRUE;
         ConfigInfo->Master = TRUE;
+        /* The virtual adapter accepts Storport's full 64-bit address range. */
+        ConfigInfo->Dma64BitAddresses = TRUE;
         ConfigInfo->CachesData = TRUE;
         ConfigInfo->MaximumNumberOfTargets = (UCHAR)DeviceExtension->StorageUnitCapacity;
         ConfigInfo->MaximumNumberOfLogicalUnits = 1;
+        ConfigInfo->MaxIOsPerLun = SPD_RING_DEFAULT_LUN_QUEUE_DEPTH;
+        ConfigInfo->InitialLunQueueDepth =
+            SPD_RING_DEFAULT_LUN_QUEUE_DEPTH;
+        ConfigInfo->MaxNumberOfIO = DeviceExtension->StorageUnitCapacity *
+            SPD_RING_DEFAULT_LUN_QUEUE_DEPTH;
         ConfigInfo->WmiDataProvider = FALSE;
         ConfigInfo->SynchronizationModel = StorSynchronizeFullDuplex;
         ConfigInfo->VirtualDevice = TRUE;

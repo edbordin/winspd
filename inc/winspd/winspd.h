@@ -85,6 +85,7 @@ typedef struct _SPD_STORAGE_UNIT
     SIZE_T SharedRingSize;
     SPD_RING_HEADER *SharedRingHeader;
     UINT32 SharedRingQueueDepth;
+    UINT32 SharedRingBufferCount;
     UINT32 SharedRingBufferSize;
     UINT32 SharedRingRequestOffset;
     UINT32 SharedRingCompletionOffset;
@@ -157,13 +158,13 @@ BOOLEAN SpdStorageUnitProcessRequest(SPD_STORAGE_UNIT *StorageUnit,
     SPD_IOCTL_TRANSACT_REQ *Request, PVOID DataBuffer,
     SPD_IOCTL_TRANSACT_RSP *Response);
 /**
- * Establish the driver-owned SharedRing V3 mapping for a storage unit.
- * The caller supplies Version and requested ring dimensions; the driver
- * fills UserAddress and SectionSize on success.
+ * Establish the driver-owned SharedRing V4 mapping for a storage unit.
+ * The caller supplies Version, queue depth, buffer count, and buffer size;
+ * the driver fills UserAddress and SectionSize on success.
  */
 DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
     SPD_IOCTL_RING_OPEN_PARAMS *Params);
-/** Close and unmap the SharedRing V3 mapping, if enabled. */
+/** Close and unmap the SharedRing V4 mapping, if enabled. */
 VOID SpdStorageUnitCloseSharedRing(SPD_STORAGE_UNIT *StorageUnit);
 /**
  * Wait for the storage unit dispatcher to stop.

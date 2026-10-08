@@ -91,6 +91,8 @@ struct _SPD_RING_RUNTIME
     PVOID RingBase;
     SPD_RING_HEADER *Header;
     UINT32 QueueDepth;
+    UINT32 BufferCount;
+    UINT32 WorkItemCount;
     UINT32 BufferSize;
     UINT32 RequestOffset;
     UINT32 CompletionOffset;
@@ -128,6 +130,11 @@ struct _SPD_RING_RUNTIME
     UINT64 QueuedResponses;
     UINT64 CompletedRequests;
     UINT32 MaxCompletionBatch;
+    UINT64 SqFullEvents;
+    UINT64 CqFullEvents;
+    UINT64 WorkItemExhaustions;
+    UINT64 WaitSubmissions;
+    UINT64 WaitCompletions;
 };
 
 static SPD_RING_RUNTIME *SpdStorageUnitRingRuntimeAcquire(
@@ -293,16 +300,17 @@ DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
 
     if (0 == Header || 0 == SectionSize ||
         SPD_RING_MAX_SECTION_BYTES < SectionSize ||
-        SPD_RING_VERSION_3 != Header->Version ||
+        SPD_RING_VERSION_4 != Header->Version ||
         sizeof *Header != Header->HeaderSize ||
         !SpdRingQueueDepthValid(Header->QueueDepth) ||
         Header->QueueDepth != Params->QueueDepth ||
-        Header->BufferCount != Header->QueueDepth ||
+        0 == Header->BufferCount ||
+        Header->BufferCount != Params->BufferCount ||
         0 == Header->BufferSize ||
         Header->BufferSize <
             StorageUnit->StorageUnitParams.MaxTransferLength ||
         Header->BufferSize != Params->BufferSize ||
-        (SIZE_T)Header->QueueDepth >
+        (SIZE_T)Header->BufferCount >
             (SIZE_T)-1 / Header->BufferSize ||
         0 != Header->Flags)
     {
@@ -311,7 +319,7 @@ DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
         return ERROR_INVALID_DATA;
     }
 
-    BufferBytes = (SIZE_T)Header->QueueDepth * Header->BufferSize;
+    BufferBytes = (SIZE_T)Header->BufferCount * Header->BufferSize;
     if (BufferBytes > SPD_RING_MAX_SECTION_BYTES)
     {
         SpdStorageUnitHandleRingClose(StorageUnit->Handle,
@@ -367,6 +375,7 @@ DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
     StorageUnit->SharedRingHeader =
         Header;
     StorageUnit->SharedRingQueueDepth = Header->QueueDepth;
+    StorageUnit->SharedRingBufferCount = Header->BufferCount;
     StorageUnit->SharedRingBufferSize = Header->BufferSize;
     StorageUnit->SharedRingRequestOffset = Header->RequestOffset;
     StorageUnit->SharedRingCompletionOffset = Header->CompletionOffset;
@@ -397,6 +406,7 @@ VOID SpdStorageUnitCloseSharedRing(SPD_STORAGE_UNIT *StorageUnit)
     StorageUnit->SharedRingSize = 0;
     StorageUnit->SharedRingHeader = 0;
     StorageUnit->SharedRingQueueDepth = 0;
+    StorageUnit->SharedRingBufferCount = 0;
     StorageUnit->SharedRingBufferSize = 0;
     StorageUnit->SharedRingRequestOffset = 0;
     StorageUnit->SharedRingCompletionOffset = 0;
@@ -666,7 +676,7 @@ static PVOID SpdRingBufferAddress(
 {
     SIZE_T BufferOffset;
 
-    if (BufferId >= Runtime->QueueDepth ||
+    if (BufferId >= Runtime->BufferCount ||
         Offset > Runtime->BufferSize ||
         Length > Runtime->BufferSize - Offset)
         return 0;
@@ -951,20 +961,22 @@ static VOID SpdRingEnsureKickOutstanding(
 static VOID SpdRingMaybeIssueWait(
     SPD_RING_RUNTIME *Runtime)
 {
+    UINT32 Tail;
+
     if (InterlockedCompareExchange(&Runtime->Stopping, 0, 0) ||
-        Runtime->WaitOutstanding ||
-        0 == Runtime->FreeItemCount)
+        Runtime->WaitOutstanding)
+        return;
+
+    Tail = SpdRingLoadAcquire32(&Runtime->Header->RequestTail.Value);
+    if (Runtime->RequestHead != Tail || 0 == Runtime->FreeItemCount)
         return;
 
     memset(&Runtime->WaitParams, 0, sizeof Runtime->WaitParams);
     Runtime->WaitParams.Btl = Runtime->StorageUnit->Btl;
-    Runtime->WaitParams.MaxRequests =
-        min(Runtime->FreeItemCount, Runtime->QueueDepth);
-    if (0 == Runtime->WaitParams.MaxRequests)
-        return;
     memset(&Runtime->WaitOverlapped, 0,
         sizeof Runtime->WaitOverlapped);
     Runtime->WaitOutstanding = TRUE;
+    Runtime->WaitSubmissions++;
     DWORD Error = SpdRingSubmitOverlapped(Runtime,
         SPD_IOCTL_RING_WAIT, &Runtime->WaitParams,
         sizeof Runtime->WaitParams, &Runtime->WaitOverlapped);
@@ -984,20 +996,24 @@ static VOID SpdRingConsumeRequests(
     LIST_ENTRY NewWork;
     UINT32 Head = Runtime->RequestHead;
     UINT32 Tail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
-    UINT32 Count = Tail - Head;
+    UINT32 Available = Tail - Head;
+    UINT32 Count;
+    UINT32 End;
     BOOLEAN InsertFailed = FALSE;
 
-    if (Count > Runtime->QueueDepth ||
-        Count != Runtime->WaitParams.Produced ||
-        Count > Runtime->WaitParams.MaxRequests)
+    if (Available > Runtime->QueueDepth)
     {
         SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
         return;
     }
+    if (Available == Runtime->QueueDepth)
+        Runtime->SqFullEvents++;
 
-    if (Count > Runtime->FreeItemCount)
+    Count = min(Available, Runtime->FreeItemCount);
+    if (0 == Count)
     {
-        SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
+        if (0 != Available)
+            Runtime->WorkItemExhaustions++;
         return;
     }
 
@@ -1018,7 +1034,8 @@ static VOID SpdRingConsumeRequests(
     SpdRingListInitialize(&NewWork);
     AcquireSRWLockExclusive(&Runtime->CompletionLock);
 
-    while (Head != Tail)
+    End = Head + Count;
+    while (Head != End)
     {
         SPD_RING_REQUEST Entry =
             RequestRing[Head & (Runtime->QueueDepth - 1)];
@@ -1074,8 +1091,9 @@ static VOID SpdRingConsumeRequests(
         ReleaseSRWLockExclusive(&Runtime->WorkLock);
     }
 
-    Runtime->RequestHead = Head;
-    SpdRingStoreRelease32(&Header->RequestHead.Value, Head);
+    Runtime->RequestHead += Count;
+    SpdRingStoreRelease32(&Header->RequestHead.Value,
+        Runtime->RequestHead);
     Runtime->SubmissionBatches++;
     Runtime->SubmittedRequests += Count;
     if (Count > Runtime->MaxSubmissionBatch)
@@ -1109,6 +1127,10 @@ static VOID SpdRingPublishCompletions(
     Available = Runtime->QueueDepth - Used;
     if (0 == Available)
     {
+        AcquireSRWLockShared(&Runtime->CompletionLock);
+        if (!SpdRingListEmpty(&Runtime->DoneQueue))
+            Runtime->CqFullEvents++;
+        ReleaseSRWLockShared(&Runtime->CompletionLock);
         SpdRingEnsureKickOutstanding(Runtime);
         return;
     }
@@ -1177,6 +1199,7 @@ static VOID SpdRingHandleWaitCompletion(
     DWORD Error)
 {
     Runtime->WaitOutstanding = FALSE;
+    Runtime->WaitCompletions++;
     if (InterlockedCompareExchange(&Runtime->Stopping, 0, 0) &&
         (ERROR_OPERATION_ABORTED == Error ||
          ERROR_CANCELLED == Error || ERROR_SUCCESS == Error))
@@ -1187,18 +1210,6 @@ static VOID SpdRingHandleWaitCompletion(
         return;
     }
 
-    if (Runtime->WaitParams.Flags &
-        ~SPD_RING_WAIT_FLAG_BUFFER_STARVED)
-    {
-        SpdRingRuntimeSetError(Runtime, ERROR_INVALID_DATA);
-        return;
-    }
-
-    SpdRingConsumeRequests(Runtime);
-    if (!InterlockedCompareExchange(&Runtime->Stopping, 0, 0) &&
-        0 == (Runtime->WaitParams.Flags &
-            SPD_RING_WAIT_FLAG_BUFFER_STARVED))
-        SpdRingMaybeIssueWait(Runtime);
 }
 
 static VOID SpdRingHandleKickCompletion(
@@ -1279,12 +1290,20 @@ static DWORD WINAPI SpdStorageUnitRingPumpThread(PVOID Runtime0)
         Error = GetLastError();
         SpdRingRuntimeSetError(Runtime, Error);
     }
-    else
-        SpdRingMaybeIssueWait(Runtime);
-
-    while (Runtime->WaitOutstanding || Runtime->KickOutstanding ||
-        !InterlockedCompareExchange(&Runtime->Stopping, 0, 0))
+    for (;;)
     {
+        if (!InterlockedCompareExchange(&Runtime->Stopping, 0, 0))
+        {
+            SpdRingConsumeRequests(Runtime);
+            SpdRingPublishCompletions(Runtime);
+            SpdRingEnsureKickOutstanding(Runtime);
+            SpdRingMaybeIssueWait(Runtime);
+        }
+
+        if (!Runtime->WaitOutstanding && !Runtime->KickOutstanding &&
+            InterlockedCompareExchange(&Runtime->Stopping, 0, 0))
+            break;
+
         BOOL Success = GetQueuedCompletionStatus(Runtime->Iocp,
             &BytesTransferred, &CompletionKey, &Overlapped, INFINITE);
         DWORD CompletionError = Success ? ERROR_SUCCESS : GetLastError();
@@ -1332,15 +1351,21 @@ static DWORD WINAPI SpdStorageUnitRingPumpThread(PVOID Runtime0)
     SpdStorageUnitSetDispatcherError(StorageUnit, Runtime->Error);
     SpdDebugLog("SharedRing batches submissions=%I64u requests=%I64u "
         "max=%lu completions=%I64u responses_queued=%I64u "
-        "responses_published=%I64u max=%lu "
-        "workers=%lu depth=%lu buffer_size=%lu error=%lu\n",
+        "responses_published=%I64u max=%lu workers=%lu "
+        "sq_full=%I64u cq_full=%I64u "
+        "workitems_starved=%I64u waits=%I64u/%I64u "
+        "depth=%lu buffers=%lu buffer_size=%lu error=%lu\n",
         Runtime->SubmissionBatches, Runtime->SubmittedRequests,
         (unsigned long)Runtime->MaxSubmissionBatch,
         Runtime->CompletionBatches, Runtime->QueuedResponses,
         Runtime->CompletedRequests,
         (unsigned long)Runtime->MaxCompletionBatch,
         (unsigned long)Runtime->WorkerCount,
+        Runtime->SqFullEvents, Runtime->CqFullEvents,
+        Runtime->WorkItemExhaustions,
+        Runtime->WaitSubmissions, Runtime->WaitCompletions,
         (unsigned long)Runtime->QueueDepth,
+        (unsigned long)Runtime->BufferCount,
         (unsigned long)Runtime->BufferSize,
         (unsigned long)Runtime->Error);
 
@@ -1358,6 +1383,8 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     SPD_RING_HEADER *Header = StorageUnit->SharedRingHeader;
     UINT32 BucketCount;
     UINT32 QueueDepth = StorageUnit->SharedRingQueueDepth;
+    UINT32 BufferCount = StorageUnit->SharedRingBufferCount;
+    UINT32 WorkItemCount = BufferCount;
     UINT32 BufferSize = StorageUnit->SharedRingBufferSize;
     UINT32 RequestOffsetExpected = StorageUnit->SharedRingRequestOffset;
     UINT32 CompletionOffsetExpected =
@@ -1372,21 +1399,22 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     DWORD Error = ERROR_SUCCESS;
 
     if (0 != StorageUnit->SharedRingRuntime ||
-        0 == Header || SPD_RING_VERSION_3 != Header->Version ||
+        0 == Header || SPD_RING_VERSION_4 != Header->Version ||
         Header->HeaderSize != sizeof *Header ||
         QueueDepth < SPD_RING_MIN_QUEUE_DEPTH ||
         QueueDepth > SPD_RING_MAX_QUEUE_DEPTH ||
         0 != (QueueDepth & (QueueDepth - 1)) ||
         Header->QueueDepth != QueueDepth ||
-        Header->BufferCount != QueueDepth ||
+        0 == BufferCount ||
+        Header->BufferCount != BufferCount ||
         Header->BufferSize != BufferSize ||
         BufferSize < StorageUnit->StorageUnitParams.MaxTransferLength ||
         0 == BufferSize ||
-        QueueDepth > (SIZE_T)-1 / BufferSize ||
+        BufferCount > (SIZE_T)-1 / BufferSize ||
         0 != Header->Flags)
         return ERROR_INVALID_PARAMETER;
 
-    BufferBytes = (SIZE_T)QueueDepth * BufferSize;
+    BufferBytes = (SIZE_T)BufferCount * BufferSize;
     RequestOffset = RequestOffsetExpected;
     CompletionOffset = SPD_IOCTL_ALIGN_UP(RequestOffset +
         (SIZE_T)QueueDepth * sizeof(SPD_RING_REQUEST),
@@ -1412,20 +1440,29 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
             0 != Header->CompletionHead.Reserved[I] ||
             0 != Header->CompletionTail.Reserved[I])
             return ERROR_INVALID_PARAMETER;
-    if (0 != SpdRingLoadAcquire32(&Header->RequestHead.Value) ||
-        0 != SpdRingLoadAcquire32(&Header->RequestTail.Value) ||
+    /* The kernel producer is autonomous in V4 and can publish requests as
+     * soon as the ring is opened, before this userspace dispatcher starts.
+     * The initial SQ may therefore be nonempty; it is still bounded by the
+     * ring depth and the consumer starts at head zero. The CQ has no producer
+     * until this dispatcher runs, so both completion cursors must be empty. */
+    UINT32 RequestHead =
+        SpdRingLoadAcquire32(&Header->RequestHead.Value);
+    UINT32 RequestTail =
+        SpdRingLoadAcquire32(&Header->RequestTail.Value);
+    if (0 != RequestHead ||
+        RequestTail - RequestHead > QueueDepth ||
         0 != SpdRingLoadAcquire32(&Header->CompletionHead.Value) ||
         0 != SpdRingLoadAcquire32(&Header->CompletionTail.Value))
         return ERROR_INVALID_PARAMETER;
 
     if (0 == WorkerCount)
         WorkerCount = 1;
-    if (WorkerCount > QueueDepth)
-        WorkerCount = QueueDepth;
+    if (WorkerCount > WorkItemCount)
+        WorkerCount = WorkItemCount;
     WorkerCapacity = WorkerCount;
 
     for (BucketCount = 1; BucketCount <
-        QueueDepth * 2; BucketCount <<= 1)
+        WorkItemCount * 2; BucketCount <<= 1)
         ;
     Runtime = MemAlloc(sizeof *Runtime);
     if (0 == Runtime)
@@ -1435,6 +1472,8 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     Runtime->RingBase = StorageUnit->SharedRingAddress;
     Runtime->Header = Header;
     Runtime->QueueDepth = QueueDepth;
+    Runtime->BufferCount = BufferCount;
+    Runtime->WorkItemCount = WorkItemCount;
     Runtime->BufferSize = BufferSize;
     Runtime->RequestOffset = RequestOffsetExpected;
     Runtime->CompletionOffset = CompletionOffsetExpected;
@@ -1449,7 +1488,7 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     Runtime->Active.BucketCount = BucketCount;
 
     Runtime->Items = MemAlloc(
-        sizeof *Runtime->Items * Runtime->QueueDepth);
+        sizeof *Runtime->Items * Runtime->WorkItemCount);
     Runtime->WorkerThreads = MemAlloc(
         sizeof *Runtime->WorkerThreads * WorkerCapacity);
     Runtime->Active.Buckets = MemAlloc(
@@ -1465,12 +1504,12 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
     }
 
     memset(Runtime->Items, 0,
-        sizeof *Runtime->Items * Runtime->QueueDepth);
+        sizeof *Runtime->Items * Runtime->WorkItemCount);
     memset(Runtime->WorkerThreads, 0,
         sizeof *Runtime->WorkerThreads * WorkerCapacity);
     for (UINT32 I = 0; BucketCount > I; I++)
         SpdRingListInitialize(&Runtime->Active.Buckets[I]);
-    for (UINT32 I = 0; Runtime->QueueDepth > I; I++)
+    for (UINT32 I = 0; Runtime->WorkItemCount > I; I++)
     {
         SpdRingListInitialize(&Runtime->Items[I].QueueLink);
         SpdRingListInitialize(&Runtime->Items[I].ActiveLink);
@@ -1478,7 +1517,7 @@ static DWORD SpdStorageUnitRingRuntimeCreate(
         SpdRingListInsertTail(&Runtime->FreeItems,
             &Runtime->Items[I].QueueLink);
     }
-    Runtime->FreeItemCount = Runtime->QueueDepth;
+    Runtime->FreeItemCount = Runtime->WorkItemCount;
 
     for (ULONG I = 0; WorkerCapacity > I; I++)
     {

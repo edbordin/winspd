@@ -242,6 +242,7 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
 NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
 {
     NTSTATUS Result = STATUS_CANCELLED;
+    BOOLEAN ScheduleRingProducer = FALSE;
     KIRQL Irql;
 
     KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
@@ -258,16 +259,18 @@ NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
 
         if (!Ioq->NonblockingConsumer)
             SpdQeventSetNoLock(&Ioq->PendingEvent);
+        else
+            ScheduleRingProducer = TRUE;
 
         Result = STATUS_SUCCESS;
     }
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
 
-    if (NT_SUCCESS(Result))
+    if (NT_SUCCESS(Result) && ScheduleRingProducer)
     {
         SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
-        SpdStorageUnitRingNotifyRequest(SrbExtension->StorageUnit);
+        SpdStorageUnitRingScheduleProducer(SrbExtension->StorageUnit);
     }
 
     return Result;
@@ -431,8 +434,10 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
                      */
                     InsertHeadList(&Ioq->PendingList, &SrbExtension->ListEntry);
 
-                    /* queue is not empty; wake up a waiter */
-                    SpdQeventSetNoLock(&Ioq->PendingEvent);
+                    /* The shared-ring KICK path schedules its producer after
+                     * returning the response and buffer. */
+                    if (!Ioq->NonblockingConsumer)
+                        SpdQeventSetNoLock(&Ioq->PendingEvent);
                 }
                 else
                     SpdSrbComplete(Ioq->DeviceExtension, SrbExtension->Srb, SrbStatus);

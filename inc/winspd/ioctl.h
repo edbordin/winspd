@@ -205,12 +205,14 @@ typedef struct
     UINT32 ProcessId;
 } SPD_IOCTL_SET_TRANSACT_PID_PARAMS;
 
-/* SharedRing V3 transports, but does not redefine, the canonical WinSpd
+/* SharedRing V4 transports, but does not redefine, the canonical WinSpd
  * transaction request and response structures above. */
 #define SPD_RING_VERSION_3              3
+#define SPD_RING_VERSION_4              4
 #define SPD_RING_CACHE_LINE_SIZE        64
 #define SPD_RING_MIN_QUEUE_DEPTH        2
 #define SPD_RING_MAX_QUEUE_DEPTH        4096
+#define SPD_RING_DEFAULT_LUN_QUEUE_DEPTH 128
 #define SPD_RING_NO_BUFFER              ((UINT32)-1)
 #define SPD_RING_MAX_SECTION_BYTES      (256ULL * 1024ULL * 1024ULL)
 #define SPD_RING_BUFFER_FLAG_NONE       0
@@ -289,8 +291,13 @@ typedef struct
     UINT64 UserAddress;
     UINT64 SectionSize;
     UINT32 Features;
-    UINT32 Reserved;
+    UINT32 BufferCount; /* Reuses the V3 Reserved field. */
 } SPD_IOCTL_RING_OPEN_PARAMS;
+
+#if defined(WINSPD_SYS_INTERNAL)
+static_assert(sizeof(SPD_IOCTL_RING_OPEN_PARAMS) == 48,
+    "SharedRing open ABI size must remain stable");
+#endif
 
 typedef struct
 {
@@ -299,15 +306,13 @@ typedef struct
     UINT32 Reserved;
 } SPD_IOCTL_RING_CLOSE_PARAMS;
 
-#define SPD_RING_WAIT_FLAG_BUFFER_STARVED 0x00000001
-
 typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
-    UINT32 MaxRequests;
-    UINT32 Produced;
-    UINT32 Flags;
+    /* A retained WAIT is completed by SQ notification or RING_STOP. Do not
+     * cancel an individual WAIT IRP; stop the ring to release it safely. */
+    UINT32 Reserved[3];
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct
