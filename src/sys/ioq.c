@@ -84,6 +84,9 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason)
 {
     KIRQL Irql;
+#if defined(WINSPD_TEST_BUILD)
+    SPD_STORAGE_UNIT *TestStorageUnit = 0;
+#endif
 
     KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
 
@@ -117,6 +120,14 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
             Flink = PendingEntry->Flink;
             SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
                 PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+#if defined(WINSPD_TEST_BUILD)
+            if (0 == TestStorageUnit &&
+                0 != SrbExtension->StorageUnit &&
+                0 != InterlockedCompareExchange(
+                    &SrbExtension->StorageUnit->Ring.TestIoqPostBarrierActive,
+                    0, 0))
+                TestStorageUnit = SrbExtension->StorageUnit;
+#endif
             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s pending ext=%p srb=%p aborted\n",
                 SpdIoqResetReasonString(Reason), SrbExtension,
                 SrbExtension->Srb);
@@ -131,6 +142,14 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
             Flink = ProcessEntry->Flink;
             SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
                 ProcessEntry, SPD_SRB_EXTENSION, ListEntry);
+#if defined(WINSPD_TEST_BUILD)
+            if (0 == TestStorageUnit &&
+                0 != SrbExtension->StorageUnit &&
+                0 != InterlockedCompareExchange(
+                    &SrbExtension->StorageUnit->Ring.TestIoqPostBarrierActive,
+                    0, 0))
+                TestStorageUnit = SrbExtension->StorageUnit;
+#endif
             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s process ext=%p srb=%p aborted\n",
                 SpdIoqResetReasonString(Reason), SrbExtension,
                 SrbExtension->Srb);
@@ -150,6 +169,10 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     }
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+#if defined(WINSPD_TEST_BUILD)
+    if (0 != TestStorageUnit)
+        SpdStorageUnitRingTestIoqResetComplete(TestStorageUnit);
+#endif
 }
 
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq)
@@ -239,8 +262,9 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
     return Result;
 }
 
-NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
+NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
 {
+    SPD_IOQ *Ioq = StorageUnit->Ioq;
     NTSTATUS Result = STATUS_CANCELLED;
     BOOLEAN ScheduleRingProducer = FALSE;
     KIRQL Irql;
@@ -267,11 +291,12 @@ NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb)
 
     KeReleaseSpinLock(&Ioq->SpinLock, Irql);
 
+#if defined(WINSPD_TEST_BUILD)
     if (NT_SUCCESS(Result) && ScheduleRingProducer)
-    {
-        SPD_SRB_EXTENSION *SrbExtension = SpdSrbExtension(Srb);
-        SpdStorageUnitRingScheduleProducer(SrbExtension->StorageUnit);
-    }
+        SpdStorageUnitRingTestIoqPostBarrier(StorageUnit);
+#endif
+    if (NT_SUCCESS(Result) && ScheduleRingProducer)
+        SpdStorageUnitRingScheduleProducer(StorageUnit);
 
     return Result;
 }

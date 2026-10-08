@@ -207,25 +207,21 @@ typedef struct
 
 /* SharedRing V4 transports, but does not redefine, the canonical WinSpd
  * transaction request and response structures above. */
-#define SPD_RING_VERSION_3              3
-#define SPD_RING_VERSION_4              4
+#define SPD_RING_VERSION                4
 #define SPD_RING_CACHE_LINE_SIZE        64
 #define SPD_RING_MIN_QUEUE_DEPTH        2
 #define SPD_RING_MAX_QUEUE_DEPTH        4096
 #define SPD_RING_DEFAULT_LUN_QUEUE_DEPTH 128
 #define SPD_RING_NO_BUFFER              ((UINT32)-1)
 #define SPD_RING_MAX_SECTION_BYTES      (256ULL * 1024ULL * 1024ULL)
-#define SPD_RING_BUFFER_FLAG_NONE       0
 
 typedef struct
 {
     UINT32 BufferId;
-    UINT32 Offset;
     UINT32 Length;
-    UINT32 Flags;
 } SPD_RING_BUFFER_REF;
 #if defined(WINSPD_SYS_INTERNAL)
-static_assert(16 == sizeof(SPD_RING_BUFFER_REF),
+static_assert(8 == sizeof(SPD_RING_BUFFER_REF),
     "unexpected SPD_RING_BUFFER_REF size");
 #endif
 
@@ -254,7 +250,6 @@ typedef __declspec(align(SPD_RING_CACHE_LINE_SIZE))
 struct _SPD_RING_CURSOR
 {
     volatile UINT32 Value;
-    UINT8 Reserved[SPD_RING_CACHE_LINE_SIZE - sizeof(UINT32)];
 } SPD_RING_CURSOR;
 
 #if defined(WINSPD_SYS_INTERNAL)
@@ -272,8 +267,6 @@ typedef struct
     UINT32 QueueDepth;
     UINT32 BufferCount;
     UINT32 BufferSize;
-    UINT32 Flags;
-    UINT32 Reserved[7];
     SPD_RING_CURSOR RequestHead;
     SPD_RING_CURSOR RequestTail;
     SPD_RING_CURSOR CompletionHead;
@@ -284,35 +277,24 @@ typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
-    UINT16 Version;
-    UINT16 Flags;
+    UINT32 Version;
     UINT32 QueueDepth;
+    UINT32 BufferCount;
     UINT32 BufferSize;
     UINT64 UserAddress;
     UINT64 SectionSize;
-    UINT32 Features;
-    UINT32 BufferCount; /* Reuses the V3 Reserved field. */
 } SPD_IOCTL_RING_OPEN_PARAMS;
-
-#if defined(WINSPD_SYS_INTERNAL)
-static_assert(sizeof(SPD_IOCTL_RING_OPEN_PARAMS) == 48,
-    "SharedRing open ABI size must remain stable");
-#endif
 
 typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
-    UINT32 Reserved;
 } SPD_IOCTL_RING_CLOSE_PARAMS;
 
 typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
-    /* A retained WAIT is completed by SQ notification or RING_STOP. Do not
-     * cancel an individual WAIT IRP; stop the ring to release it safely. */
-    UINT32 Reserved[3];
 } SPD_IOCTL_RING_WAIT_PARAMS;
 
 typedef struct
@@ -320,7 +302,6 @@ typedef struct
     SPD_IOCTL_BASE_PARAMS Base;
     UINT32 Btl;
     UINT32 Consumed;
-    UINT32 Reserved[2];
 } SPD_IOCTL_RING_KICK_PARAMS;
 #pragma warning(pop)
 

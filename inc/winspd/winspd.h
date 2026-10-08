@@ -92,6 +92,10 @@ typedef struct _SPD_STORAGE_UNIT
     UINT32 SharedRingBufferOffset;
     SRWLOCK SharedRingRuntimeLock;
     PVOID SharedRingRuntime;
+#if defined(WINSPD_TEST_BUILD)
+    VOID (*SharedRingTestPumpHook)(PVOID Context);
+    PVOID SharedRingTestPumpContext;
+#endif
 } SPD_STORAGE_UNIT;
 typedef struct _SPD_STORAGE_UNIT_OPERATION_CONTEXT
 {

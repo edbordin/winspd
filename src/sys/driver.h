@@ -350,7 +350,12 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason);
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);
 NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb);
-NTSTATUS SpdIoqPostSrb(SPD_IOQ *Ioq, PVOID Srb);
+struct _SPD_STORAGE_UNIT;
+/*
+ * Caller must hold a live StorageUnit reference
+ * for the duration of SpdIoqPostSrb().
+ */
+NTSTATUS SpdIoqPostSrb(struct _SPD_STORAGE_UNIT *StorageUnit, PVOID Srb);
 NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
@@ -392,6 +397,11 @@ typedef struct
     SPD_RING_BUFFER_META *Meta;
 } SPD_RING_BUFFER_POOL;
 
+/* ProducerState owns one producer lifetime reference while ACTIVE/RERUN. */
+#define SPD_RING_PRODUCER_IDLE     0L
+#define SPD_RING_PRODUCER_ACTIVE   1L
+#define SPD_RING_PRODUCER_RERUN    2L
+
 typedef struct
 {
     /* System VA owned by Mdl via MmGetSystemAddressForMdlSafe. */
@@ -410,19 +420,29 @@ typedef struct
     PVOID volatile WaitIrp;
     KDPC ProducerDpc;
     volatile LONG ProducerState;
+#if DBG
+    volatile LONG ProducerExecuting;
+    volatile LONG ProducerLiveReferences;
+#endif
+#if defined(WINSPD_TEST_BUILD)
+    PKEVENT TestIoqPostEnteredEvent;
+    PKEVENT TestIoqPostReleaseEvent;
+    PKEVENT TestIoqPostResetDoneEvent;
+    volatile LONG TestIoqPostBarrierActive;
+#endif
     volatile LONG KickActive;
     BOOLEAN Stopping;
     BOOLEAN Failed;
     ULONG ActiveCalls;
     KEVENT IdleEvent;
     ULONG ProcessId;
-    volatile LONG SqFullEvents;
-    volatile LONG BufferPoolExhaustions;
-    volatile LONG WaitSubmissions;
-    volatile LONG WaitCompletions;
-    volatile LONG ProducerDpcRuns;
-    volatile LONG ProducerDpcReruns;
-    volatile LONG ProducerProduced;
+    volatile LONG64 SqFullEvents;
+    volatile LONG64 BufferPoolExhaustions;
+    volatile LONG64 WaitSubmissions;
+    volatile LONG64 WaitCompletions;
+    volatile LONG64 ProducerDpcRuns;
+    volatile LONG64 ProducerDpcReruns;
+    volatile LONG64 ProducerProduced;
     volatile LONG ProducerMaxBatch;
 
     /* Ring lifetime and mapping state. */
@@ -491,6 +511,12 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
     SPD_IOCTL_RING_WAIT_PARAMS *Params,
     PIRP Irp);
 VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit);
+#if defined(WINSPD_TEST_BUILD)
+VOID SpdStorageUnitRingTestIoqPostBarrier(
+    SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingTestIoqResetComplete(
+    SPD_STORAGE_UNIT *StorageUnit);
+#endif
 VOID SpdStorageUnitRingStopForRemoval(SPD_STORAGE_UNIT *StorageUnit);
 NTSTATUS SpdStorageUnitRingKick(
     SPD_STORAGE_UNIT *StorageUnit,

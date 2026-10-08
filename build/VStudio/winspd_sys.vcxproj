@@ -194,6 +194,11 @@
       <Command>call "$(SolutionDir)..\..\tools\mkcat.bat" arm64 "$(OutDir)" $(TargetName).inf $(TargetName).sys $(TargetName).dll</Command>
     </PostBuildEvent>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Platform)'=='ARM64' and '$(Configuration)'=='Debug'">
+    <ClCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WINSPD_TEST_BUILD</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>

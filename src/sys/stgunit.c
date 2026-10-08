@@ -25,6 +25,14 @@ ERESOURCE SpdGlobalDeviceResource;
 SPD_DEVICE_EXTENSION *SpdGlobalDeviceExtension;
 ULONG SpdStorageUnitCapacity = SPD_IOCTL_STORAGE_UNIT_CAPACITY;
 
+/*
+ * Limit work performed in one producer DPC invocation.
+ *
+ * SpdSrbExecuteScsiPrepare may copy MaxTransferLength
+ * bytes while holding the IOQ spinlock. Keep this small
+ * until the prepare/copy critical section is optimized
+ * and DPC execution time has been measured.
+ */
 #define SPD_RING_MAX_PRODUCER_BATCH 4
 
 static VOID SpdDeviceExtensionNotifyRoutine(HANDLE ParentId, HANDLE ProcessId0, BOOLEAN Create);
@@ -40,6 +48,71 @@ static VOID SpdStorageUnitRingCompleteWait(
     NTSTATUS Status,
     BOOLEAN RequireRequest);
 static VOID SpdStorageUnitRingCancelWait(SPD_STORAGE_UNIT *StorageUnit);
+
+#if defined(WINSPD_TEST_BUILD)
+static PKEVENT SpdRingTestOpenEvent(PCWSTR Name)
+{
+    UNICODE_STRING NameString;
+    OBJECT_ATTRIBUTES ObjectAttributes;
+    HANDLE Handle = 0;
+    PKEVENT Event = 0;
+    NTSTATUS Status;
+
+    RtlInitUnicodeString(&NameString, Name);
+    InitializeObjectAttributes(&ObjectAttributes, &NameString,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, 0, 0);
+    Status = ZwOpenEvent(&Handle, EVENT_MODIFY_STATE, &ObjectAttributes);
+    if (NT_SUCCESS(Status))
+    {
+        Status = ObReferenceObjectByHandle(Handle, EVENT_MODIFY_STATE,
+            *ExEventObjectType, KernelMode, (PVOID *)&Event, 0);
+        ZwClose(Handle);
+        if (!NT_SUCCESS(Status))
+            Event = 0;
+    }
+    return Event;
+}
+
+VOID SpdStorageUnitRingTestIoqPostBarrier(
+    SPD_STORAGE_UNIT *StorageUnit)
+{
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    PKEVENT EnteredEvent;
+    PKEVENT ReleaseEvent;
+
+    /* Ring close releases these event references after active-call rundown. */
+    if (!SpdStorageUnitRingEnter(StorageUnit))
+        return;
+
+    EnteredEvent = Ring->TestIoqPostEnteredEvent;
+    ReleaseEvent = Ring->TestIoqPostReleaseEvent;
+    if (0 == EnteredEvent || 0 == ReleaseEvent)
+    {
+        SpdStorageUnitRingLeave(StorageUnit);
+        return;
+    }
+
+    InterlockedExchange(&Ring->TestIoqPostBarrierActive, 1);
+    KeSetEvent(EnteredEvent, IO_NO_INCREMENT, FALSE);
+    while (0 == KeReadStateEvent(ReleaseEvent))
+        KeStallExecutionProcessor(50);
+    InterlockedExchange(&Ring->TestIoqPostBarrierActive, 0);
+
+    SpdStorageUnitRingLeave(StorageUnit);
+}
+
+VOID SpdStorageUnitRingTestIoqResetComplete(
+    SPD_STORAGE_UNIT *StorageUnit)
+{
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+
+    if (0 != InterlockedCompareExchange(
+            &Ring->TestIoqPostBarrierActive, 0, 0) &&
+        0 != Ring->TestIoqPostResetDoneEvent)
+        KeSetEvent(Ring->TestIoqPostResetDoneEvent,
+            IO_NO_INCREMENT, FALSE);
+}
+#endif
 
 static BOOLEAN SpdRingSizeAdd(SIZE_T *PSize, SIZE_T Add)
 {
@@ -97,6 +170,18 @@ static VOID SpdStorageUnitRingReset(
         SpdFree(Ring->Buffers.FreeIds, SpdTagStorageUnit);
     if (0 != Ring->Buffers.Meta)
         SpdFree(Ring->Buffers.Meta, SpdTagStorageUnit);
+#if defined(WINSPD_TEST_BUILD)
+    if (0 != Ring->TestIoqPostEnteredEvent)
+        ObDereferenceObject(Ring->TestIoqPostEnteredEvent);
+    if (0 != Ring->TestIoqPostReleaseEvent)
+        ObDereferenceObject(Ring->TestIoqPostReleaseEvent);
+    if (0 != Ring->TestIoqPostResetDoneEvent)
+        ObDereferenceObject(Ring->TestIoqPostResetDoneEvent);
+    Ring->TestIoqPostEnteredEvent = 0;
+    Ring->TestIoqPostReleaseEvent = 0;
+    Ring->TestIoqPostResetDoneEvent = 0;
+    InterlockedExchange(&Ring->TestIoqPostBarrierActive, 0);
+#endif
     Ring->Buffers.FreeIds = 0;
     Ring->Buffers.Meta = 0;
     Ring->Buffers.FreeCount = 0;
@@ -112,7 +197,7 @@ static VOID SpdStorageUnitRingReset(
     Ring->ProcessId = 0;
     Ring->UserProcessId = 0;
     InterlockedExchangePointer(&Ring->WaitIrp, 0);
-    InterlockedExchange(&Ring->ProducerState, 0);
+    InterlockedExchange(&Ring->ProducerState, SPD_RING_PRODUCER_IDLE);
     InterlockedExchange(&Ring->KickActive, 0);
     /* Close is terminal for this storage unit. */
     Ring->Stopping = TRUE;
@@ -158,18 +243,16 @@ static VOID SpdRingBufferFreeLocked(
 static PVOID SpdRingBufferAddress(
     SPD_RING_STATE *Ring,
     UINT32 BufferId,
-    UINT32 Offset,
     UINT32 Length)
 {
     SIZE_T BufferOffset;
 
     if (BufferId >= Ring->BufferCount ||
-        Offset > Ring->BufferSize ||
-        Length > Ring->BufferSize - Offset)
+        Length > Ring->BufferSize)
         return 0;
 
     BufferOffset = (SIZE_T)Ring->BufferOffset +
-        (SIZE_T)BufferId * Ring->BufferSize + Offset;
+        (SIZE_T)BufferId * Ring->BufferSize;
     if (BufferOffset > Ring->SectionSize ||
         Length > Ring->SectionSize - BufferOffset)
         return 0;
@@ -190,6 +273,22 @@ static VOID SpdStorageUnitRingMarkFailed(
     SpdIoqReset(StorageUnit->Ioq, TRUE,
         SpdIoqResetReasonRingFailure);
     SpdStorageUnitRingCancelWait(StorageUnit);
+}
+
+static VOID SpdStorageUnitRingReleaseProducerReference(
+    SPD_STORAGE_UNIT *StorageUnit)
+{
+    SPD_DEVICE_EXTENSION *DeviceExtension =
+        StorageUnit->Ioq->DeviceExtension;
+
+#if DBG
+    SPD_RING_STATE *Ring = &StorageUnit->Ring;
+    LONG LiveReferences = InterlockedDecrement(
+        &Ring->ProducerLiveReferences);
+    ASSERT(0 <= LiveReferences);
+#endif
+    SpdStorageUnitRingLeave(StorageUnit);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 }
 
 NTSTATUS SpdStorageUnitRingOpen(
@@ -216,15 +315,48 @@ NTSTATUS SpdStorageUnitRingOpen(
     UINT32 *FreeIds = 0;
     SPD_RING_BUFFER_META *Meta = 0;
     KIRQL Irql;
+#if defined(WINSPD_TEST_BUILD)
+    PKEVENT TestPostEnteredEvent = 0;
+    PKEVENT TestPostReleaseEvent = 0;
+    PKEVENT TestPostResetDoneEvent = 0;
+#endif
 
     if (ProcessId != StorageUnit->TransactProcessId)
         return STATUS_ACCESS_DENIED;
-    if (SPD_RING_VERSION_4 != Params->Version)
+    if (SPD_RING_VERSION != Params->Version)
         return STATUS_NOT_SUPPORTED;
-    if (0 != Params->Flags || 0 == Params->BufferCount ||
+    if (0 == Params->BufferCount ||
         !SpdRingQueueDepthValid(Params->QueueDepth) ||
         Params->BufferSize < StorageUnit->StorageUnitParams.MaxTransferLength)
         return STATUS_INVALID_PARAMETER;
+
+#if defined(WINSPD_TEST_BUILD)
+    TestPostEnteredEvent = SpdRingTestOpenEvent(
+        L"\\BaseNamedObjects\\WinSpdSharedRingTestPostEntered");
+    TestPostReleaseEvent = SpdRingTestOpenEvent(
+        L"\\BaseNamedObjects\\WinSpdSharedRingTestPostRelease");
+    TestPostResetDoneEvent = SpdRingTestOpenEvent(
+        L"\\BaseNamedObjects\\WinSpdSharedRingTestPostResetDone");
+    if (0 == TestPostEnteredEvent || 0 == TestPostReleaseEvent ||
+        0 == TestPostResetDoneEvent)
+    {
+        if (0 != TestPostEnteredEvent)
+        {
+            ObDereferenceObject(TestPostEnteredEvent);
+            TestPostEnteredEvent = 0;
+        }
+        if (0 != TestPostReleaseEvent)
+        {
+            ObDereferenceObject(TestPostReleaseEvent);
+            TestPostReleaseEvent = 0;
+        }
+        if (0 != TestPostResetDoneEvent)
+        {
+            ObDereferenceObject(TestPostResetDoneEvent);
+            TestPostResetDoneEvent = 0;
+        }
+    }
+#endif
 
     if ((SIZE_T)-1 / Params->BufferCount < Params->BufferSize)
         return STATUS_INVALID_PARAMETER;
@@ -320,7 +452,7 @@ NTSTATUS SpdStorageUnitRingOpen(
 
     RtlZeroMemory(SystemAddress, SectionSize);
     Header = (SPD_RING_HEADER *)SystemAddress;
-    Header->Version = SPD_RING_VERSION_4;
+    Header->Version = SPD_RING_VERSION;
     Header->HeaderSize = sizeof *Header;
     Header->RequestOffset = (UINT32)SPD_IOCTL_ALIGN_UP(
         sizeof *Header, SPD_RING_CACHE_LINE_SIZE);
@@ -365,8 +497,14 @@ NTSTATUS SpdStorageUnitRingOpen(
     Ring->ProcessId = ProcessId;
     Ring->UserProcessId = ProcessId;
     Ring->Failed = FALSE;
+#if defined(WINSPD_TEST_BUILD)
+    Ring->TestIoqPostEnteredEvent = TestPostEnteredEvent;
+    Ring->TestIoqPostReleaseEvent = TestPostReleaseEvent;
+    Ring->TestIoqPostResetDoneEvent = TestPostResetDoneEvent;
+    InterlockedExchange(&Ring->TestIoqPostBarrierActive, 0);
+#endif
     InterlockedExchangePointer(&Ring->WaitIrp, 0);
-    InterlockedExchange(&Ring->ProducerState, 0);
+    InterlockedExchange(&Ring->ProducerState, SPD_RING_PRODUCER_IDLE);
     InterlockedExchange(&Ring->KickActive, 0);
     KeSetEvent(&Ring->IdleEvent, IO_NO_INCREMENT, FALSE);
     KeReleaseSpinLock(&Ring->Lock, Irql);
@@ -375,17 +513,29 @@ NTSTATUS SpdStorageUnitRingOpen(
 
     Params->UserAddress = (UINT64)(UINT_PTR)UserAddress;
     Params->SectionSize = SectionSize;
-    Params->Features = 0;
     SectionHandle = 0;
     Mdl = 0;
     UserAddress = 0;
     FreeIds = 0;
     Meta = 0;
+#if defined(WINSPD_TEST_BUILD)
+    TestPostEnteredEvent = 0;
+    TestPostReleaseEvent = 0;
+    TestPostResetDoneEvent = 0;
+#endif
     SystemAddress = 0;
     PagesLocked = FALSE;
     Result = STATUS_SUCCESS;
 
 exit:
+#if defined(WINSPD_TEST_BUILD)
+    if (0 != TestPostEnteredEvent)
+        ObDereferenceObject(TestPostEnteredEvent);
+    if (0 != TestPostReleaseEvent)
+        ObDereferenceObject(TestPostReleaseEvent);
+    if (0 != TestPostResetDoneEvent)
+        ObDereferenceObject(TestPostResetDoneEvent);
+#endif
     if (0 != Mdl)
     {
         if (PagesLocked)
@@ -439,9 +589,15 @@ VOID SpdStorageUnitRingClose(
     SpdStorageUnitRingCancelWait(StorageUnit);
     KeWaitForSingleObject(&Ring->IdleEvent,
         Executive, KernelMode, FALSE, NULL);
+#if DBG
+    ASSERT(0 == Ring->ProducerExecuting);
+    ASSERT(0 == Ring->ProducerLiveReferences);
+    ASSERT(0 == Ring->ActiveCalls);
+#endif
     DbgPrint(DRIVER_NAME ": SharedRing close depth=%lu buffers=%lu "
-        "sq_full=%ld buffer_starved=%ld waits=%ld/%ld producer_runs=%ld "
-        "producer_reruns=%ld produced=%ld max_batch=%ld\n",
+        "sq_full=%I64d buffer_starved=%I64d waits=%I64d/%I64d "
+        "producer_runs=%I64d producer_reruns=%I64d "
+        "produced=%I64d max_batch=%ld\n",
         Ring->QueueDepth, Ring->BufferCount,
         Ring->SqFullEvents, Ring->BufferPoolExhaustions,
         Ring->WaitSubmissions, Ring->WaitCompletions,
@@ -599,7 +755,7 @@ static UINT32 SpdRingProduceBatch(
     Free = Ring->QueueDepth - Used;
     if (0 == Free)
     {
-        InterlockedIncrement(&Ring->SqFullEvents);
+        InterlockedIncrement64(&Ring->SqFullEvents);
         return 0;
     }
     Budget = min(Free, SPD_RING_MAX_PRODUCER_BATCH);
@@ -624,13 +780,13 @@ static UINT32 SpdRingProduceBatch(
         }
         if (!SpdRingBufferAllocLocked(Ring, &BufferId))
         {
-            InterlockedIncrement(&Ring->BufferPoolExhaustions);
+            InterlockedIncrement64(&Ring->BufferPoolExhaustions);
             KeReleaseSpinLock(&Ring->Lock, Irql);
             break;
         }
         KeReleaseSpinLock(&Ring->Lock, Irql);
 
-        DataBuffer = SpdRingBufferAddress(Ring, BufferId, 0,
+        DataBuffer = SpdRingBufferAddress(Ring, BufferId,
             Ring->BufferSize);
         if (0 == DataBuffer)
         {
@@ -677,9 +833,7 @@ static UINT32 SpdRingProduceBatch(
         if (NeedsBuffer)
         {
             Data.BufferId = BufferId;
-            Data.Offset = 0;
             Data.Length = DataLength;
-            Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
             KeAcquireSpinLock(&Ring->Lock, &Irql);
             ASSERT(Ring->Buffers.Meta[BufferId].Allocated);
             Ring->Buffers.Meta[BufferId].OwnerHint = Request.Hint;
@@ -695,9 +849,7 @@ static UINT32 SpdRingProduceBatch(
             SpdRingBufferFreeLocked(Ring, BufferId);
             KeReleaseSpinLock(&Ring->Lock, Irql);
             Data.BufferId = SPD_RING_NO_BUFFER;
-            Data.Offset = 0;
             Data.Length = 0;
-            Data.Flags = SPD_RING_BUFFER_FLAG_NONE;
         }
 
         Entry = &RequestRing[Tail & (Ring->QueueDepth - 1)];
@@ -741,7 +893,8 @@ static UINT32 SpdRingProduceBatch(
 
     if (0 != Produced)
     {
-        InterlockedExchangeAdd(&Ring->ProducerProduced, (LONG)Produced);
+        InterlockedExchangeAdd64(&Ring->ProducerProduced,
+            (LONG64)Produced);
         for (;;)
         {
             LONG MaxBatch = InterlockedCompareExchange(
@@ -800,7 +953,7 @@ static VOID SpdStorageUnitRingCompleteWait(
     Irp->IoStatus.Status = Status;
     Irp->IoStatus.Information = NT_SUCCESS(Status) ?
         sizeof(SPD_IOCTL_RING_WAIT_PARAMS) : 0;
-    InterlockedIncrement(&Ring->WaitCompletions);
+        InterlockedIncrement64(&Ring->WaitCompletions);
     StorPortCompleteServiceIrp(DeviceExtension, Irp);
     SpdStorageUnitRingLeave(StorageUnit);
     SpdStorageUnitDereference(DeviceExtension, StorageUnit);
@@ -823,13 +976,12 @@ static VOID SpdStorageUnitRingProducerDpc(
 
     SPD_STORAGE_UNIT *StorageUnit = DeferredContext;
     SPD_RING_STATE *Ring = &StorageUnit->Ring;
-    SPD_DEVICE_EXTENSION *DeviceExtension =
-        StorageUnit->Ioq->DeviceExtension;
 
     ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
-    InterlockedIncrement(&Ring->ProducerDpcRuns);
+    InterlockedIncrement64(&Ring->ProducerDpcRuns);
 
     BOOLEAN BatchLimitReached = FALSE;
+    BOOLEAN SchedulingFailed = FALSE;
     KIRQL Irql;
     BOOLEAN Stopping;
 
@@ -837,38 +989,53 @@ static VOID SpdStorageUnitRingProducerDpc(
     Stopping = Ring->Stopping || Ring->Failed;
     KeReleaseSpinLock(&Ring->Lock, Irql);
 
+#if DBG
+    ASSERT(0 == InterlockedCompareExchange(
+        &Ring->ProducerExecuting, 1, 0));
+#endif
     if (!Stopping)
         SpdRingProduceBatch(StorageUnit, &BatchLimitReached);
     SpdStorageUnitRingCompleteWait(
         StorageUnit, STATUS_SUCCESS, TRUE);
+#if DBG
+    ASSERT(1 == InterlockedExchange(
+        &Ring->ProducerExecuting, 0));
+#endif
 
     if (Stopping)
     {
-        InterlockedExchange(&Ring->ProducerState, 0);
+        InterlockedExchange(&Ring->ProducerState,
+            SPD_RING_PRODUCER_IDLE);
         goto exit;
     }
 
     if (BatchLimitReached &&
-        1 == InterlockedCompareExchange(&Ring->ProducerState, 2, 1))
-        InterlockedIncrement(&Ring->ProducerDpcReruns);
+        SPD_RING_PRODUCER_ACTIVE == InterlockedCompareExchange(
+            &Ring->ProducerState, SPD_RING_PRODUCER_RERUN,
+            SPD_RING_PRODUCER_ACTIVE))
+        InterlockedIncrement64(&Ring->ProducerDpcReruns);
 
     for (;;)
     {
         LONG State = InterlockedCompareExchange(
-            &Ring->ProducerState, 0, 1);
-        if (1 == State)
+            &Ring->ProducerState, SPD_RING_PRODUCER_IDLE,
+            SPD_RING_PRODUCER_ACTIVE);
+        if (SPD_RING_PRODUCER_ACTIVE == State)
             goto exit;
-        if (2 == State)
+        if (SPD_RING_PRODUCER_RERUN == State)
         {
-            if (2 != InterlockedCompareExchange(
-                    &Ring->ProducerState, 1, 2))
+            if (SPD_RING_PRODUCER_RERUN != InterlockedCompareExchange(
+                    &Ring->ProducerState, SPD_RING_PRODUCER_ACTIVE,
+                    SPD_RING_PRODUCER_RERUN))
                 continue;
 
-            /* Transfer this execution's lifetime reference to the queued
-             * continuation. FALSE means another queued invocation already
-             * owns its own reference; release this invocation's reference. */
+            /* Keep the execution guard clear while the continuation is
+             * queued; it protects only the production/notification section. */
             if (KeInsertQueueDpc(&Ring->ProducerDpc, 0, 0))
                 return;
+            SpdStorageUnitRingMarkFailed(StorageUnit);
+            DbgPrint(DRIVER_NAME ": SharedRing producer continuation queue failed\n");
+            SchedulingFailed = TRUE;
             goto exit;
         }
 
@@ -877,8 +1044,9 @@ static VOID SpdStorageUnitRingProducerDpc(
     }
 
 exit:
-    SpdStorageUnitRingLeave(StorageUnit);
-    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+    SpdStorageUnitRingReleaseProducerReference(StorageUnit);
+    if (SchedulingFailed)
+        ASSERT(FALSE);
 }
 
 VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit)
@@ -905,28 +1073,30 @@ VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit)
     for (;;)
     {
         LONG State = InterlockedCompareExchange(
-            &Ring->ProducerState, 1, 0);
-        if (0 == State)
+            &Ring->ProducerState, SPD_RING_PRODUCER_ACTIVE,
+            SPD_RING_PRODUCER_IDLE);
+        if (SPD_RING_PRODUCER_IDLE == State)
         {
+#if DBG
+            /* Count before insertion so a fast DPC cannot release first. */
+            InterlockedIncrement(&Ring->ProducerLiveReferences);
+#endif
             if (KeInsertQueueDpc(&Ring->ProducerDpc, 0, 0))
                 return;
 
-            /* FALSE means this KDPC is already queued. That queued/running
-             * instance owns its own rundown reference; request another pass
-             * and release this scheduler's temporary references. */
-            if (1 == InterlockedCompareExchange(
-                    &Ring->ProducerState, 2, 1))
-                InterlockedIncrement(&Ring->ProducerDpcReruns);
-            SpdStorageUnitRingLeave(StorageUnit);
-            SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+            SpdStorageUnitRingMarkFailed(StorageUnit);
+            DbgPrint(DRIVER_NAME ": SharedRing producer DPC queue failed\n");
+            SpdStorageUnitRingReleaseProducerReference(StorageUnit);
+            ASSERT(FALSE);
             return;
         }
-        if (1 == State)
+        if (SPD_RING_PRODUCER_ACTIVE == State)
         {
-            if (1 == InterlockedCompareExchange(
-                    &Ring->ProducerState, 2, 1))
+            if (SPD_RING_PRODUCER_ACTIVE == InterlockedCompareExchange(
+                    &Ring->ProducerState, SPD_RING_PRODUCER_RERUN,
+                    SPD_RING_PRODUCER_ACTIVE))
             {
-                InterlockedIncrement(&Ring->ProducerDpcReruns);
+                InterlockedIncrement64(&Ring->ProducerDpcReruns);
                 SpdStorageUnitRingLeave(StorageUnit);
                 SpdStorageUnitDereference(DeviceExtension, StorageUnit);
                 return;
@@ -958,13 +1128,6 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
         Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
         return SpdServiceIrpCompleteNow;
     }
-    for (UINT32 I = 0; ARRAYSIZE(Params->Reserved) > I; I++)
-        if (0 != Params->Reserved[I])
-        {
-            Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
-            return SpdServiceIrpCompleteNow;
-        }
-
     /* Protect the handler's short registration tail separately from the
      * reference transferred to the retained WAIT IRP. */
     KeAcquireSpinLock(&DeviceExtension->SpinLock, &Irql);
@@ -995,7 +1158,7 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
         return SpdServiceIrpCompleteNow;
     }
 
-    InterlockedIncrement(&Ring->WaitSubmissions);
+    InterlockedIncrement64(&Ring->WaitSubmissions);
     SpdStorageUnitRingScheduleProducer(StorageUnit);
 
     /* STOP may have won after RingEnter but before waiter installation. */
@@ -1081,8 +1244,6 @@ NTSTATUS SpdStorageUnitRingKick(
             SPD_RING_BUFFER_META Meta;
 
             if (BufferId >= Ring->BufferCount ||
-                0 != Data->Offset ||
-                SPD_RING_BUFFER_FLAG_NONE != Data->Flags ||
                 Data->Length > Ring->BufferSize)
             {
                 Failed = TRUE;
@@ -1104,7 +1265,7 @@ NTSTATUS SpdStorageUnitRingKick(
             }
 
             DataBuffer = SpdRingBufferAddress(Ring, BufferId,
-                Data->Offset, Data->Length);
+                Data->Length);
             if (0 == DataBuffer)
             {
                 Failed = TRUE;
@@ -1112,8 +1273,7 @@ NTSTATUS SpdStorageUnitRingKick(
                 break;
             }
         }
-        else if (0 != Data->Offset || 0 != Data->Length ||
-            SPD_RING_BUFFER_FLAG_NONE != Data->Flags)
+        else if (0 != Data->Length)
         {
             Failed = TRUE;
             Result = STATUS_INVALID_PARAMETER;

@@ -709,7 +709,7 @@ static UCHAR SpdScsiPostSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUnit
         SrbExtension->SystemDataLength = DataLength;
     }
 
-    Result = SpdIoqPostSrb(StorageUnit->Ioq, Srb);
+    Result = SpdIoqPostSrb(StorageUnit, Srb);
     return NT_SUCCESS(Result) ? SRB_STATUS_PENDING : SRB_STATUS_ABORTED;
 }
 
