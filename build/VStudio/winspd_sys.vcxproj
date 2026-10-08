@@ -180,7 +180,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='ARM64'">
     <ClCompile>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NTDDI_VERSION=0x0A000008;_WIN32_WINNT=0x0A00</PreprocessorDefinitions>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);NTDDI_VERSION=0x0A000008;_WIN32_WINNT=0x0A00;STOR_ADDRESS_TYPE_NVME=0x2</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\..\src;..\..\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
