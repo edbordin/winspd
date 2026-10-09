@@ -323,6 +323,9 @@ typedef struct
 {
     PVOID DeviceExtension;
     KSPIN_LOCK SpinLock;
+    volatile LONG64 SpinLockWaitTicks;
+    volatile LONG64 SpinLockHoldTicks;
+    volatile LONG64 SpinLockAcquisitions;
     BOOLEAN Stopped;
     BOOLEAN NonblockingConsumer;
     SPD_QEVENT PendingEvent;
@@ -349,8 +352,14 @@ VOID SpdIoqSetNonblockingConsumer(SPD_IOQ *Ioq);
 VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason);
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);
+VOID SpdIoqLogDiagnostics(SPD_IOQ *Ioq);
 NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb);
 struct _SPD_STORAGE_UNIT;
+struct _SPD_SRB_EXTENSION;
+VOID SpdStorageUnitRingTestPrepareCopyBarrier(
+    struct _SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingTestCompletionCopyBarrier(
+    struct _SPD_STORAGE_UNIT *StorageUnit);
 /*
  * Caller must hold a live StorageUnit reference
  * for the duration of SpdIoqPostSrb().
@@ -359,6 +368,21 @@ NTSTATUS SpdIoqPostSrb(struct _SPD_STORAGE_UNIT *StorageUnit, PVOID Srb);
 NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
+NTSTATUS SpdIoqRingClaimSrb(SPD_IOQ *Ioq,
+    struct _SPD_SRB_EXTENSION **PSrbExtension);
+VOID SpdIoqRingAcquireCommitLock(SPD_IOQ *Ioq, KIRQL *PIrql,
+    LARGE_INTEGER *PStart);
+VOID SpdIoqRingReleaseCommitLock(SPD_IOQ *Ioq, KIRQL Irql,
+    LARGE_INTEGER Start);
+BOOLEAN SpdIoqRingCommitPreparedSrbNoLock(SPD_IOQ *Ioq,
+    struct _SPD_SRB_EXTENSION *SrbExtension, BOOLEAN AbortAll,
+    PVOID *PSrb, BOOLEAN *PAbortRequested);
+NTSTATUS SpdIoqRingClaimCompletion(SPD_IOQ *Ioq, UINT64 Hint,
+    struct _SPD_SRB_EXTENSION **PSrbExtension);
+NTSTATUS SpdIoqRingFinishCompletion(SPD_IOQ *Ioq,
+    struct _SPD_SRB_EXTENSION *SrbExtension, UCHAR SrbStatus);
+ULONG SpdIoqRingLeasedCount(SPD_IOQ *Ioq);
+BOOLEAN SpdIoqRingHasPending(SPD_IOQ *Ioq);
 NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP CancellableIrp,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
@@ -369,6 +393,15 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
     PVOID SrbExtension,
     UCHAR (*Complete)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
+typedef enum
+{
+    SpdRingSrbNone = 0,
+    SpdRingSrbPending,
+    SpdRingSrbPreparing,
+    SpdRingSrbInFlight,
+    SpdRingSrbCompleting
+} SPD_RING_SRB_STATE;
+
 typedef struct _SPD_SRB_EXTENSION
 {
     struct _SPD_STORAGE_UNIT *StorageUnit;
@@ -378,6 +411,8 @@ typedef struct _SPD_SRB_EXTENSION
     PVOID SystemDataBuffer;
     ULONG SystemDataLength;
     ULONG ChunkOffset;
+    SPD_RING_SRB_STATE RingState;
+    BOOLEAN RingAbortPending;
 } SPD_SRB_EXTENSION;
 #define SpdSrbExtension(Srb)            ((SPD_SRB_EXTENSION *)SrbGetMiniportContext(Srb))
 
@@ -418,7 +453,9 @@ typedef struct
     SPD_RING_BUFFER_POOL Buffers;
     KSPIN_LOCK Lock;
     PVOID volatile WaitIrp;
-    KDPC ProducerDpc;
+    PVOID ProducerWorker;
+    SPD_SRB_EXTENSION **ProducerClaims;
+    PVOID *ProducerAbortedSrbs;
     volatile LONG ProducerState;
 #if DBG
     volatile LONG ProducerExecuting;
@@ -428,6 +465,10 @@ typedef struct
     PKEVENT TestIoqPostEnteredEvent;
     PKEVENT TestIoqPostReleaseEvent;
     PKEVENT TestIoqPostResetDoneEvent;
+    PKEVENT TestProducerPrepareEnteredEvent;
+    PKEVENT TestProducerPrepareReleaseEvent;
+    PKEVENT TestCompletionCopyEnteredEvent;
+    PKEVENT TestCompletionCopyReleaseEvent;
     volatile LONG TestIoqPostBarrierActive;
 #endif
     volatile LONG KickActive;
@@ -440,9 +481,17 @@ typedef struct
     volatile LONG64 BufferPoolExhaustions;
     volatile LONG64 WaitSubmissions;
     volatile LONG64 WaitCompletions;
-    volatile LONG64 ProducerDpcRuns;
-    volatile LONG64 ProducerDpcReruns;
+    volatile LONG64 ProducerWorkerRuns;
+    volatile LONG64 ProducerWorkerReruns;
     volatile LONG64 ProducerProduced;
+    volatile LONG64 ProducerBatchLe1;
+    volatile LONG64 ProducerBatch2To4;
+    volatile LONG64 ProducerBatch5To16;
+    volatile LONG64 ProducerBatch17To64;
+    volatile LONG64 ProducerBatchOver64;
+    volatile LONG64 ProducerPrepareTicks;
+    volatile LONG64 CompletionCopyTicks;
+    volatile LONG64 DeferredSrbAborts;
     volatile LONG ProducerMaxBatch;
 
     /* Ring lifetime and mapping state. */

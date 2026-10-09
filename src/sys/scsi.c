@@ -715,7 +715,7 @@ static UCHAR SpdScsiPostSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUnit
 
 VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuffer)
 {
-    ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
+    ASSERT(DISPATCH_LEVEL >= KeGetCurrentIrql());
 
     SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
     SPD_STORAGE_UNIT *StorageUnit = SrbExtension->StorageUnit;
@@ -770,6 +770,7 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
             SrbExtension->ChunkOffset / StorageUnit->StorageUnitParams.BlockLength;
         Req->Op.Write.BlockCount =
             ChunkLength / StorageUnit->StorageUnitParams.BlockLength;
+        SpdStorageUnitRingTestPrepareCopyBarrier(StorageUnit);
         RtlCopyMemory(DataBuffer,
             (PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset, ChunkLength);
         return;
@@ -818,7 +819,7 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
 
 UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBuffer)
 {
-    ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
+    ASSERT(DISPATCH_LEVEL >= KeGetCurrentIrql());
 
     SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
     SPD_STORAGE_UNIT *StorageUnit = SrbExtension->StorageUnit;
@@ -844,6 +845,7 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
         ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
         if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
             ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
+        SpdStorageUnitRingTestCompletionCopyBarrier(StorageUnit);
         if (0 != DataBuffer)
             RtlCopyMemory((PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset,
                 DataBuffer, ChunkLength);

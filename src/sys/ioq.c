@@ -21,6 +21,45 @@
 
 #include <sys/driver.h>
 
+static VOID SpdIoqAcquireSpinLock(
+    SPD_IOQ *Ioq, KIRQL *PIrql, LARGE_INTEGER *PStart)
+{
+    LARGE_INTEGER Before = KeQueryPerformanceCounter(0);
+    LARGE_INTEGER After;
+
+    KeAcquireSpinLock(&Ioq->SpinLock, PIrql);
+    After = KeQueryPerformanceCounter(0);
+    InterlockedExchangeAdd64(&Ioq->SpinLockWaitTicks,
+        After.QuadPart - Before.QuadPart);
+    InterlockedIncrement64(&Ioq->SpinLockAcquisitions);
+    *PStart = After;
+}
+
+static VOID SpdIoqReleaseSpinLock(
+    SPD_IOQ *Ioq, KIRQL Irql, LARGE_INTEGER Start)
+{
+    LARGE_INTEGER End = KeQueryPerformanceCounter(0);
+    InterlockedExchangeAdd64(&Ioq->SpinLockHoldTicks,
+        End.QuadPart - Start.QuadPart);
+    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+}
+
+static VOID SpdIoqRemoveProcessHashNoLock(
+    SPD_IOQ *Ioq, SPD_SRB_EXTENSION *SrbExtension)
+{
+    ULONG Index = SpdHashMixPointer(SrbExtension) %
+        Ioq->ProcessBucketCount;
+    for (PVOID *P = &Ioq->ProcessBuckets[Index]; *P;
+        P = &((SPD_SRB_EXTENSION *)(*P))->HashNext)
+        if (*P == SrbExtension)
+        {
+            *P = SrbExtension->HashNext;
+            SrbExtension->HashNext = 0;
+            return;
+        }
+    ASSERT(FALSE);
+}
+
 NTSTATUS SpdIoqCreate(PVOID DeviceExtension, SPD_IOQ **PIoq)
 {
     SPD_IOQ *Ioq;
@@ -55,12 +94,32 @@ VOID SpdIoqDelete(SPD_IOQ *Ioq)
 VOID SpdIoqSetNonblockingConsumer(SPD_IOQ *Ioq)
 {
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     Ioq->NonblockingConsumer = TRUE;
+    for (PLIST_ENTRY Entry = Ioq->PendingList.Flink;
+        Entry != &Ioq->PendingList; Entry = Entry->Flink)
+    {
+        SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+            Entry, SPD_SRB_EXTENSION, ListEntry);
+        SrbExtension->RingState = SpdRingSrbPending;
+        SrbExtension->RingAbortPending = FALSE;
+    }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+}
+
+VOID SpdIoqLogDiagnostics(SPD_IOQ *Ioq)
+{
+    LARGE_INTEGER Frequency;
+    (void)KeQueryPerformanceCounter(&Frequency);
+    DbgPrint(DRIVER_NAME ": IOQ spinlock acquisitions=%I64d wait_ticks=%I64d hold_ticks=%I64d qpc_hz=%I64d\n",
+        InterlockedCompareExchange64(&Ioq->SpinLockAcquisitions, 0, 0),
+        InterlockedCompareExchange64(&Ioq->SpinLockWaitTicks, 0, 0),
+        InterlockedCompareExchange64(&Ioq->SpinLockHoldTicks, 0, 0),
+        Frequency.QuadPart);
 }
 
 static const char *SpdIoqResetReasonString(
@@ -84,15 +143,22 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason)
 {
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 #if defined(WINSPD_TEST_BUILD)
     SPD_STORAGE_UNIT *TestStorageUnit = 0;
 #endif
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
-    if (!Ioq->Stopped)
+    if (Stop)
     {
-        PLIST_ENTRY PendingEntry, ProcessEntry, Flink;
+        Ioq->Stopped = TRUE;
+        /* STOP rejects new leases immediately and wakes legacy consumers. */
+        SpdQeventSetNoLock(&Ioq->PendingEvent);
+    }
+
+    if (!Ioq->Stopped || Stop)
+    {
         ULONG PendingCount = 0;
         ULONG ProcessCount = 0;
 
@@ -106,20 +172,17 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
             SpdIoqResetReasonString(Reason), (unsigned)Stop,
             PendingCount, ProcessCount);
 
-        PendingEntry = Ioq->PendingList.Flink;
-        ProcessEntry = Ioq->ProcessList.Flink;
-
-        InitializeListHead(&Ioq->PendingList);
-        InitializeListHead(&Ioq->ProcessList);
-        RtlZeroMemory(Ioq->ProcessBuckets,
-            Ioq->ProcessBucketCount * sizeof Ioq->ProcessBuckets[0]);
-
-        for (; PendingEntry != &Ioq->PendingList; PendingEntry = Flink)
+        while (!IsListEmpty(&Ioq->PendingList))
         {
-            /* store Flink now, because *PendingEntry becomes invalid after SpdSrbComplete */
-            Flink = PendingEntry->Flink;
+            PLIST_ENTRY PendingEntry = RemoveHeadList(&Ioq->PendingList);
             SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
                 PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+            PVOID Srb = SrbExtension->Srb;
+            SrbExtension->ListEntry.Flink =
+                SrbExtension->ListEntry.Blink = 0;
+            SrbExtension->RingState = SpdRingSrbNone;
+            SrbExtension->RingAbortPending = FALSE;
+            SrbExtension->Srb = 0;
 #if defined(WINSPD_TEST_BUILD)
             if (0 == TestStorageUnit &&
                 0 != SrbExtension->StorageUnit &&
@@ -130,18 +193,36 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
 #endif
             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s pending ext=%p srb=%p aborted\n",
                 SpdIoqResetReasonString(Reason), SrbExtension,
-                SrbExtension->Srb);
+                Srb);
             SpdSrbComplete(
                 Ioq->DeviceExtension,
-                SrbExtension->Srb,
+                Srb,
                 SRB_STATUS_ABORTED);
         }
-        for (; ProcessEntry != &Ioq->ProcessList; ProcessEntry = Flink)
+
+        PLIST_ENTRY ProcessEntry = Ioq->ProcessList.Flink;
+        while (ProcessEntry != &Ioq->ProcessList)
         {
-            /* store Flink now, because *ProcessEntry becomes invalid after SpdSrbComplete */
-            Flink = ProcessEntry->Flink;
             SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
                 ProcessEntry, SPD_SRB_EXTENSION, ListEntry);
+            PLIST_ENTRY NextEntry = ProcessEntry->Flink;
+
+            if (SpdRingSrbPreparing == SrbExtension->RingState ||
+                SpdRingSrbCompleting == SrbExtension->RingState)
+            {
+                SrbExtension->RingAbortPending = TRUE;
+                ProcessEntry = NextEntry;
+                continue;
+            }
+
+            SpdIoqRemoveProcessHashNoLock(Ioq, SrbExtension);
+            RemoveEntryList(&SrbExtension->ListEntry);
+            SrbExtension->ListEntry.Flink =
+                SrbExtension->ListEntry.Blink = 0;
+            SrbExtension->RingState = SpdRingSrbNone;
+            SrbExtension->RingAbortPending = FALSE;
+            PVOID Srb = SrbExtension->Srb;
+            SrbExtension->Srb = 0;
 #if defined(WINSPD_TEST_BUILD)
             if (0 == TestStorageUnit &&
                 0 != SrbExtension->StorageUnit &&
@@ -152,23 +233,16 @@ VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
 #endif
             DbgPrint(DRIVER_NAME ": IOQ RESET reason=%s process ext=%p srb=%p aborted\n",
                 SpdIoqResetReasonString(Reason), SrbExtension,
-                SrbExtension->Srb);
+                Srb);
             SpdSrbComplete(
                 Ioq->DeviceExtension,
-                SrbExtension->Srb,
+                Srb,
                 SRB_STATUS_ABORTED);
-        }
-
-        if (Stop)
-        {
-            Ioq->Stopped = TRUE;
-
-            /* we are being stopped, permanently wake up waiters */
-            SpdQeventSetNoLock(&Ioq->PendingEvent);
+            ProcessEntry = NextEntry;
         }
     }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 #if defined(WINSPD_TEST_BUILD)
     if (0 != TestStorageUnit)
         SpdStorageUnitRingTestIoqResetComplete(TestStorageUnit);
@@ -179,12 +253,13 @@ BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq)
 {
     BOOLEAN Result;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     Result = Ioq->Stopped;
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
     return Result;
 }
@@ -193,8 +268,9 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
 {
     NTSTATUS Result = STATUS_NOT_FOUND;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     if (!Ioq->Stopped)
     {
@@ -209,6 +285,14 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
             0 != SrbExtension->ListEntry.Flink &&
             0 != SrbExtension->ListEntry.Blink)
         {
+            if (SpdRingSrbPreparing == SrbExtension->RingState ||
+                SpdRingSrbCompleting == SrbExtension->RingState)
+            {
+                SrbExtension->RingAbortPending = TRUE;
+                Result = STATUS_SUCCESS;
+                goto exit;
+            }
+
             for (PLIST_ENTRY Entry = Ioq->PendingList.Flink;
                 Entry != &Ioq->PendingList; Entry = Entry->Flink)
                 if (Entry == &SrbExtension->ListEntry)
@@ -240,6 +324,8 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
                 RemoveEntryList(&SrbExtension->ListEntry);
                 SrbExtension->ListEntry.Flink =
                     SrbExtension->ListEntry.Blink = 0;
+                SrbExtension->RingState = SpdRingSrbNone;
+                SrbExtension->RingAbortPending = FALSE;
                 SrbExtension->Srb = 0;
                 SpdSrbComplete(Ioq->DeviceExtension, Srb,
                     SRB_STATUS_ABORTED);
@@ -257,7 +343,8 @@ NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb)
         DbgPrint(DRIVER_NAME ": IOQ CANCEL target-srb=%p CANCELLED stopped=1\n",
             Srb);
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+exit:
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
     return Result;
 }
@@ -268,8 +355,9 @@ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
     NTSTATUS Result = STATUS_CANCELLED;
     BOOLEAN ScheduleRingProducer = FALSE;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     if (!Ioq->Stopped)
     {
@@ -277,6 +365,9 @@ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
 
         ASSERT(0 == SrbExtension->Srb);
         SrbExtension->Srb = Srb;
+        SrbExtension->RingState = Ioq->NonblockingConsumer ?
+            SpdRingSrbPending : SpdRingSrbNone;
+        SrbExtension->RingAbortPending = FALSE;
 
         ASSERT(0 == SrbExtension->ListEntry.Flink && 0 == SrbExtension->ListEntry.Blink);
         InsertTailList(&Ioq->PendingList, &SrbExtension->ListEntry);
@@ -289,7 +380,7 @@ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
         Result = STATUS_SUCCESS;
     }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
 #if defined(WINSPD_TEST_BUILD)
     if (NT_SUCCESS(Result) && ScheduleRingProducer)
@@ -301,16 +392,214 @@ NTSTATUS SpdIoqPostSrb(SPD_STORAGE_UNIT *StorageUnit, PVOID Srb)
     return Result;
 }
 
+NTSTATUS SpdIoqRingClaimSrb(
+    SPD_IOQ *Ioq, SPD_SRB_EXTENSION **PSrbExtension)
+{
+    NTSTATUS Result;
+    KIRQL Irql;
+    LARGE_INTEGER LockStart;
+
+    *PSrbExtension = 0;
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+    if (Ioq->Stopped)
+        Result = STATUS_CANCELLED;
+    else if (IsListEmpty(&Ioq->PendingList))
+        Result = STATUS_NOT_FOUND;
+    else
+    {
+        PLIST_ENTRY PendingEntry = RemoveHeadList(&Ioq->PendingList);
+        SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+            PendingEntry, SPD_SRB_EXTENSION, ListEntry);
+        ULONG Index = SpdHashMixPointer(SrbExtension) %
+            Ioq->ProcessBucketCount;
+
+        InsertTailList(&Ioq->ProcessList, &SrbExtension->ListEntry);
+#if DBG
+        for (PVOID X = Ioq->ProcessBuckets[Index]; X;
+            X = ((SPD_SRB_EXTENSION *)X)->HashNext)
+            ASSERT(X != SrbExtension);
+        ASSERT(0 == SrbExtension->HashNext);
+#endif
+        SrbExtension->HashNext = Ioq->ProcessBuckets[Index];
+        Ioq->ProcessBuckets[Index] = SrbExtension;
+        SrbExtension->RingState = SpdRingSrbPreparing;
+        SrbExtension->RingAbortPending = FALSE;
+        *PSrbExtension = SrbExtension;
+        Result = STATUS_SUCCESS;
+    }
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+    return Result;
+}
+
+VOID SpdIoqRingAcquireCommitLock(
+    SPD_IOQ *Ioq, KIRQL *PIrql, LARGE_INTEGER *PStart)
+{
+    SpdIoqAcquireSpinLock(Ioq, PIrql, PStart);
+}
+
+VOID SpdIoqRingReleaseCommitLock(
+    SPD_IOQ *Ioq, KIRQL Irql, LARGE_INTEGER Start)
+{
+    SpdIoqReleaseSpinLock(Ioq, Irql, Start);
+}
+
+/* Caller holds Ioq->SpinLock as part of Ring->Lock -> Ioq->SpinLock commit. */
+BOOLEAN SpdIoqRingCommitPreparedSrbNoLock(
+    SPD_IOQ *Ioq,
+    SPD_SRB_EXTENSION *SrbExtension,
+    BOOLEAN AbortAll,
+    PVOID *PSrb,
+    BOOLEAN *PAbortRequested)
+{
+    ASSERT(SpdRingSrbPreparing == SrbExtension->RingState);
+    ASSERT(0 != SrbExtension->Srb);
+    *PSrb = 0;
+    *PAbortRequested = SrbExtension->RingAbortPending;
+
+    if (AbortAll || SrbExtension->RingAbortPending)
+    {
+        SpdIoqRemoveProcessHashNoLock(Ioq, SrbExtension);
+        RemoveEntryList(&SrbExtension->ListEntry);
+        SrbExtension->ListEntry.Flink =
+            SrbExtension->ListEntry.Blink = 0;
+        *PSrb = SrbExtension->Srb;
+        SrbExtension->Srb = 0;
+        SrbExtension->RingState = SpdRingSrbNone;
+        SrbExtension->RingAbortPending = FALSE;
+        return FALSE;
+    }
+
+    SrbExtension->RingState = SpdRingSrbInFlight;
+    return TRUE;
+}
+
+NTSTATUS SpdIoqRingClaimCompletion(
+    SPD_IOQ *Ioq, UINT64 Hint, SPD_SRB_EXTENSION **PSrbExtension)
+{
+    NTSTATUS Result = STATUS_NOT_FOUND;
+    PVOID HintPointer = (PVOID)(UINT_PTR)Hint;
+    ULONG Index = SpdHashMixPointer(HintPointer) %
+        Ioq->ProcessBucketCount;
+    KIRQL Irql;
+    LARGE_INTEGER LockStart;
+
+    *PSrbExtension = 0;
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+    if (Ioq->Stopped)
+        Result = STATUS_CANCELLED;
+    else
+    {
+        for (PVOID P = Ioq->ProcessBuckets[Index]; P;
+            P = ((SPD_SRB_EXTENSION *)P)->HashNext)
+            if (P == HintPointer)
+            {
+                SPD_SRB_EXTENSION *SrbExtension = P;
+                if (SpdRingSrbInFlight == SrbExtension->RingState)
+                {
+                    SrbExtension->RingState = SpdRingSrbCompleting;
+                    *PSrbExtension = SrbExtension;
+                    Result = STATUS_SUCCESS;
+                }
+                break;
+            }
+    }
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+    return Result;
+}
+
+NTSTATUS SpdIoqRingFinishCompletion(
+    SPD_IOQ *Ioq, SPD_SRB_EXTENSION *SrbExtension, UCHAR SrbStatus)
+{
+    KIRQL Irql;
+    LARGE_INTEGER LockStart;
+    PVOID Srb = 0;
+    BOOLEAN Complete = FALSE;
+
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+    ASSERT(SpdRingSrbCompleting == SrbExtension->RingState);
+    ASSERT(0 != SrbExtension->Srb);
+
+    SpdIoqRemoveProcessHashNoLock(Ioq, SrbExtension);
+    RemoveEntryList(&SrbExtension->ListEntry);
+    SrbExtension->ListEntry.Flink =
+        SrbExtension->ListEntry.Blink = 0;
+
+    if (SrbExtension->RingAbortPending)
+    {
+        SrbStatus = SRB_STATUS_ABORTED;
+        Srb = SrbExtension->Srb;
+        SrbExtension->Srb = 0;
+        SrbExtension->RingState = SpdRingSrbNone;
+        SrbExtension->RingAbortPending = FALSE;
+        InterlockedIncrement64(
+            &SrbExtension->StorageUnit->Ring.DeferredSrbAborts);
+        Complete = TRUE;
+    }
+    else if (SRB_STATUS_PENDING == SrbStatus)
+    {
+        SrbExtension->RingState = SpdRingSrbPending;
+        InsertHeadList(&Ioq->PendingList, &SrbExtension->ListEntry);
+        if (!Ioq->NonblockingConsumer)
+            SpdQeventSetNoLock(&Ioq->PendingEvent);
+    }
+    else
+    {
+        Srb = SrbExtension->Srb;
+        SrbExtension->Srb = 0;
+        SrbExtension->RingState = SpdRingSrbNone;
+        SrbExtension->RingAbortPending = FALSE;
+        Complete = TRUE;
+    }
+
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+    if (Complete)
+        SpdSrbComplete(Ioq->DeviceExtension, Srb, SrbStatus);
+    return STATUS_SUCCESS;
+}
+
+ULONG SpdIoqRingLeasedCount(SPD_IOQ *Ioq)
+{
+    ULONG Count = 0;
+    KIRQL Irql;
+    LARGE_INTEGER LockStart;
+
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+    for (PLIST_ENTRY Entry = Ioq->ProcessList.Flink;
+        Entry != &Ioq->ProcessList; Entry = Entry->Flink)
+    {
+        SPD_SRB_EXTENSION *SrbExtension = CONTAINING_RECORD(
+            Entry, SPD_SRB_EXTENSION, ListEntry);
+        if (SpdRingSrbPreparing == SrbExtension->RingState ||
+            SpdRingSrbCompleting == SrbExtension->RingState)
+            Count++;
+    }
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+    return Count;
+}
+
+BOOLEAN SpdIoqRingHasPending(SPD_IOQ *Ioq)
+{
+    BOOLEAN HasPending;
+    KIRQL Irql;
+    LARGE_INTEGER LockStart;
+
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
+    HasPending = !Ioq->Stopped && !IsListEmpty(&Ioq->PendingList);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
+    return HasPending;
+}
+
 NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer)
 {
     NTSTATUS Result;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
     ASSERT(DISPATCH_LEVEL == KeGetCurrentIrql());
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     if (Ioq->Stopped)
     {
@@ -353,7 +642,7 @@ NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
         Result = STATUS_SUCCESS;
     }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
     return Result;
 }
@@ -364,6 +653,7 @@ NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP Can
 {
     NTSTATUS Result;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
     Result = SpdQeventCancellableWait(&Ioq->PendingEvent, Timeout, CancellableIrp);
     if (STATUS_TIMEOUT == Result)
@@ -372,7 +662,7 @@ NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP Can
         return STATUS_CANCELLED;
     ASSERT(STATUS_SUCCESS == Result);
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     if (!Ioq->Stopped)
     {
@@ -417,7 +707,7 @@ NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP Can
         Result = STATUS_CANCELLED;
     }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
     return Result;
 }
@@ -429,8 +719,9 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
 {
     NTSTATUS Result;
     KIRQL Irql;
+    LARGE_INTEGER LockStart;
 
-    KeAcquireSpinLock(&Ioq->SpinLock, &Irql);
+    SpdIoqAcquireSpinLock(Ioq, &Irql, &LockStart);
 
     if (!Ioq->Stopped)
     {
@@ -493,7 +784,7 @@ NTSTATUS SpdIoqEndProcessingSrbByExtension(SPD_IOQ *Ioq,
         DbgPrint("\n");
     }
 
-    KeReleaseSpinLock(&Ioq->SpinLock, Irql);
+    SpdIoqReleaseSpinLock(Ioq, Irql, LockStart);
 
     return Result;
 }

@@ -35,6 +35,10 @@ typedef struct _RING_TEST_STATE
     HANDLE IoqPostEntered;
     HANDLE IoqPostRelease;
     HANDLE IoqPostResetDone;
+    HANDLE ProducerPrepareEntered;
+    HANDLE ProducerPrepareRelease;
+    HANDLE CompletionCopyEntered;
+    HANDLE CompletionCopyRelease;
     LONG PumpHookRuns;
 #endif
     SRWLOCK AsyncLock;
@@ -49,6 +53,7 @@ typedef struct _RING_TEST_STATE
     LONG ReadCallbacks;
     LONG TestReadCalls;
     LONG WriteCallbacks;
+    LONG VerifyChunkOffsets;
     LONG Failure;
     UINT32 QueueDepth;
     UINT64 SlowReadBlockAddress;
@@ -621,6 +626,22 @@ static const GUID RingTestGuidWaitTeardown =
     { 0x51aeb053, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x13 } };
 static const GUID RingTestGuidOwnerDeath =
     { 0x51aeb054, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x14 } };
+static const GUID RingTestGuidLeaseCancelWrite =
+    { 0x51aeb055, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x15 } };
+static const GUID RingTestGuidLeaseResetWrite =
+    { 0x51aeb056, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x16 } };
+static const GUID RingTestGuidLeaseStopWrite =
+    { 0x51aeb057, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x17 } };
+static const GUID RingTestGuidLeaseCancelRead =
+    { 0x51aeb058, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x18 } };
+static const GUID RingTestGuidLeaseResetRead =
+    { 0x51aeb059, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x19 } };
+static const GUID RingTestGuidBatchAbortCompact =
+    { 0x51aeb05a, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x1a } };
+static const GUID RingTestGuidFullSqResume =
+    { 0x51aeb05b, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x1b } };
+static const GUID RingTestGuidChunkOffsets =
+    { 0x51aeb05c, 0x2a8e, 0x4d44, { 0x91, 0xa8, 0x3f, 0x86, 0x11, 0x2f, 0x31, 0x1c } };
 
 #if defined(WINSPD_TEST_BUILD)
 static VOID ring_test_pause_pump(PVOID Context)
@@ -733,8 +754,21 @@ static BOOLEAN ring_test_read(SPD_STORAGE_UNIT *StorageUnit,
         }
     }
     if (0 != Buffer)
-        memset(Buffer, 0x5a,
-            (SIZE_T)BlockCount * StorageUnit->StorageUnitParams.BlockLength);
+    {
+        SIZE_T Length = (SIZE_T)BlockCount *
+            StorageUnit->StorageUnitParams.BlockLength;
+        if (0 != InterlockedCompareExchange(
+                &State->VerifyChunkOffsets, 0, 0))
+        {
+            UINT8 *Bytes = Buffer;
+            UINT64 Start = BlockAddress *
+                StorageUnit->StorageUnitParams.BlockLength;
+            for (SIZE_T I = 0; Length > I; I++)
+                Bytes[I] = (UINT8)(Start + I);
+        }
+        else
+            memset(Buffer, 0x5a, Length);
+    }
 
     AsyncMode = IsTestRead ?
         InterlockedCompareExchange(&State->AsyncMode, 0, 0) :
@@ -832,15 +866,23 @@ static BOOLEAN ring_test_write(SPD_STORAGE_UNIT *StorageUnit,
     UNREFERENCED_PARAMETER(Flush);
     memset(Status, 0, sizeof *Status);
     if (RingTestBlockAddress <= BlockAddress &&
-        BlockAddress < RingTestBlockAddress + 16)
+        BlockAddress < RingTestBlockAddress + 32)
     {
         InterlockedIncrement(&State->WriteCallbacks);
+        UINT64 Start = BlockAddress *
+            StorageUnit->StorageUnitParams.BlockLength;
+        BOOLEAN VerifyOffsets = 0 != InterlockedCompareExchange(
+            &State->VerifyChunkOffsets, 0, 0);
         for (SIZE_T I = 0; Length > I; I++)
-            if (0x3c != ((PUINT8)Buffer)[I])
+        {
+            UINT8 Expected = VerifyOffsets ?
+                (UINT8)(Start + I) : 0x3c;
+            if (Expected != ((PUINT8)Buffer)[I])
             {
                 InterlockedExchange(&State->Failure, 1);
                 break;
             }
+        }
     }
     return TRUE;
 }
@@ -891,6 +933,22 @@ static VOID ring_test_create_with_buffer_count(RING_TEST_STATE *State,
         ASSERT(SetEvent(State->IoqPostRelease));
         ASSERT(ResetEvent(State->IoqPostResetDone));
     }
+    State->ProducerPrepareEntered = CreateEventW(0, TRUE, FALSE,
+        L"Global\\WinSpdSharedRingTestPrepareEntered");
+    State->ProducerPrepareRelease = CreateEventW(0, TRUE, TRUE,
+        L"Global\\WinSpdSharedRingTestPrepareRelease");
+    State->CompletionCopyEntered = CreateEventW(0, TRUE, FALSE,
+        L"Global\\WinSpdSharedRingTestCompletionEntered");
+    State->CompletionCopyRelease = CreateEventW(0, TRUE, TRUE,
+        L"Global\\WinSpdSharedRingTestCompletionRelease");
+    ASSERT(0 != State->ProducerPrepareEntered);
+    ASSERT(0 != State->ProducerPrepareRelease);
+    ASSERT(0 != State->CompletionCopyEntered);
+    ASSERT(0 != State->CompletionCopyRelease);
+    ASSERT(ResetEvent(State->ProducerPrepareEntered));
+    ASSERT(SetEvent(State->ProducerPrepareRelease));
+    ASSERT(ResetEvent(State->CompletionCopyEntered));
+    ASSERT(SetEvent(State->CompletionCopyRelease));
 #else
     UNREFERENCED_PARAMETER(IoqPostBarrier);
 #endif
@@ -1040,6 +1098,14 @@ static VOID ring_test_destroy(RING_TEST_STATE *State)
         CloseHandle(State->IoqPostRelease);
     if (0 != State->IoqPostResetDone)
         CloseHandle(State->IoqPostResetDone);
+    if (0 != State->ProducerPrepareEntered)
+        CloseHandle(State->ProducerPrepareEntered);
+    if (0 != State->ProducerPrepareRelease)
+        CloseHandle(State->ProducerPrepareRelease);
+    if (0 != State->CompletionCopyEntered)
+        CloseHandle(State->CompletionCopyEntered);
+    if (0 != State->CompletionCopyRelease)
+        CloseHandle(State->CompletionCopyRelease);
 #endif
 }
 
@@ -2767,6 +2833,465 @@ static void ioctl_ring_wait_notification_test(void)
 }
 
 #if defined(WINSPD_TEST_BUILD)
+typedef struct _RING_TEST_STOP_THREAD
+{
+    RING_TEST_STATE *State;
+    HANDLE Finished;
+    DWORD Error;
+} RING_TEST_STOP_THREAD;
+
+typedef struct _RING_TEST_COMPLETE_THREAD
+{
+    RING_TEST_STATE *State;
+    HANDLE Finished;
+    DWORD Error;
+    BOOLEAN TestRead;
+} RING_TEST_COMPLETE_THREAD;
+
+static HANDLE ring_test_open_overlapped_disk(
+    RING_TEST_STATE *State, DWORD Access)
+{
+    return CreateFileW(State->DiskPath, Access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, 0);
+}
+
+static DWORD ring_test_begin_overlapped_io(
+    HANDLE DiskHandle, BOOLEAN Write, UINT64 BlockAddress,
+    PVOID Buffer, DWORD Length, OVERLAPPED *Overlapped)
+{
+    LARGE_INTEGER Offset;
+    DWORD Transferred = 0;
+    BOOL Success;
+
+    memset(Overlapped, 0, sizeof *Overlapped);
+    Overlapped->hEvent = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == Overlapped->hEvent)
+        return GetLastError();
+    Offset.QuadPart = (LONGLONG)BlockAddress * RingTestDataLength;
+    Overlapped->Offset = Offset.LowPart;
+    Overlapped->OffsetHigh = Offset.HighPart;
+    Success = Write ? WriteFile(DiskHandle, Buffer, Length,
+        &Transferred, Overlapped) : ReadFile(DiskHandle, Buffer, Length,
+        &Transferred, Overlapped);
+    if (Success)
+        return ERROR_SUCCESS;
+    DWORD Error = GetLastError();
+    return ERROR_IO_PENDING == Error ? ERROR_SUCCESS : Error;
+}
+
+static DWORD ring_test_finish_overlapped_io(
+    HANDLE DiskHandle, OVERLAPPED *Overlapped, DWORD Timeout)
+{
+    DWORD Transferred = 0;
+    if (WAIT_OBJECT_0 != WaitForSingleObject(Overlapped->hEvent, Timeout))
+        return ERROR_TIMEOUT;
+    return GetOverlappedResult(DiskHandle, Overlapped,
+        &Transferred, FALSE) ? ERROR_SUCCESS : GetLastError();
+}
+
+static DWORD ring_test_reset_device(HANDLE DiskHandle)
+{
+    OVERLAPPED Overlapped;
+    DWORD BytesReturned = 0;
+    BOOL Success;
+    DWORD Error;
+
+    memset(&Overlapped, 0, sizeof Overlapped);
+    Overlapped.hEvent = CreateEventW(0, TRUE, FALSE, 0);
+    if (0 == Overlapped.hEvent)
+        return GetLastError();
+    Success = DeviceIoControl(DiskHandle, IOCTL_STORAGE_RESET_DEVICE,
+        0, 0, 0, 0, &BytesReturned, &Overlapped);
+    if (Success)
+        Error = ERROR_SUCCESS;
+    else if (ERROR_IO_PENDING == (Error = GetLastError()))
+        Error = ring_test_finish_overlapped_io(
+            DiskHandle, &Overlapped, RingTestWaitTimeoutMs);
+    CloseHandle(Overlapped.hEvent);
+    return Error;
+}
+
+static DWORD WINAPI ring_test_stop_ring_thread(PVOID Data)
+{
+    RING_TEST_STOP_THREAD *Work = Data;
+    Work->Error = ring_test_stop_ring(Work->State);
+    SetEvent(Work->Finished);
+    return Work->Error;
+}
+
+static DWORD WINAPI ring_test_complete_one_thread(PVOID Data)
+{
+    RING_TEST_COMPLETE_THREAD *Work = Data;
+    Work->Error = ring_test_complete_one_manually(
+        Work->State, &Work->TestRead);
+    SetEvent(Work->Finished);
+    return Work->Error;
+}
+
+static DWORD ring_test_wait_for_sq_count(
+    RING_TEST_STATE *State, UINT32 Expected)
+{
+    SPD_RING_HEADER *Header = State->StorageUnit->SharedRingHeader;
+    ULONGLONG Deadline = GetTickCount64() + RingTestWaitTimeoutMs;
+    UINT32 Available;
+
+    do
+    {
+        UINT32 Head = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+        UINT32 Tail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+        Available = Tail - Head;
+        if (Available >= Expected)
+            return Available;
+        Sleep(1);
+    } while (GetTickCount64() < Deadline);
+    return Available;
+}
+
+static DWORD ring_test_write_prepare_lease_case(
+    const GUID *Guid, LONG Action)
+{
+    RING_TEST_STATE State;
+    HANDLE DiskHandle;
+    OVERLAPPED Overlapped;
+    UINT8 WriteData[RingTestDataLength];
+    SPD_RING_HEADER *Header;
+    UINT32 TailBefore;
+    DWORD Error;
+
+    ring_test_create(&State, Guid, 16);
+    ring_test_wait_for_disk_manual(&State);
+    ASSERT(ERROR_SUCCESS == ring_test_retire_manual_wait(&State));
+    ASSERT(0 == ring_test_request_available(&State));
+    DiskHandle = ring_test_open_overlapped_disk(&State,
+        GENERIC_READ | GENERIC_WRITE);
+    ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    memset(WriteData, 0x3c, sizeof WriteData);
+    ASSERT(ResetEvent(State.ProducerPrepareEntered));
+    ASSERT(ResetEvent(State.ProducerPrepareRelease));
+    Header = State.StorageUnit->SharedRingHeader;
+    TailBefore = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+    Error = ring_test_begin_overlapped_io(DiskHandle, TRUE,
+        RingTestBlockAddress, WriteData, sizeof WriteData, &Overlapped);
+    ASSERT(ERROR_SUCCESS == Error);
+    ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+        State.ProducerPrepareEntered, RingTestWaitTimeoutMs));
+    ASSERT(TailBefore == SpdRingLoadAcquire32(&Header->RequestTail.Value));
+
+    if (0 == Action)
+        ASSERT(CancelIoEx(DiskHandle, &Overlapped));
+    else if (1 == Action)
+    {
+        /* Reset must return while the producer still owns the lease. */
+        ASSERT(ERROR_SUCCESS == ring_test_reset_device(DiskHandle));
+    }
+    else
+    {
+        RING_TEST_STOP_THREAD Stop;
+        HANDLE StopThread;
+        memset(&Stop, 0, sizeof Stop);
+        Stop.State = &State;
+        Stop.Finished = CreateEventW(0, TRUE, FALSE, 0);
+        ASSERT(0 != Stop.Finished);
+        StopThread = CreateThread(0, 0,
+            ring_test_stop_ring_thread, &Stop, 0, 0);
+        ASSERT(0 != StopThread);
+        ASSERT(WAIT_TIMEOUT == WaitForSingleObject(Stop.Finished, 100));
+        ASSERT(TailBefore == SpdRingLoadAcquire32(
+            &Header->RequestTail.Value));
+        ASSERT(SetEvent(State.ProducerPrepareRelease));
+        ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+            Stop.Finished, RingTestWaitTimeoutMs));
+        ASSERT(ERROR_SUCCESS == Stop.Error);
+        WaitForSingleObject(StopThread, RingTestWaitTimeoutMs);
+        CloseHandle(StopThread);
+        CloseHandle(Stop.Finished);
+    }
+
+    if (0 != Action && 2 != Action)
+        ASSERT(SetEvent(State.ProducerPrepareRelease));
+    Error = ring_test_finish_overlapped_io(
+        DiskHandle, &Overlapped, RingTestWaitTimeoutMs);
+    ASSERT(ERROR_OPERATION_ABORTED == Error || ERROR_CANCELLED == Error);
+    ASSERT(TailBefore == SpdRingLoadAcquire32(&Header->RequestTail.Value));
+    CloseHandle(Overlapped.hEvent);
+    CloseHandle(DiskHandle);
+    ring_test_destroy(&State);
+    return ERROR_SUCCESS;
+}
+
+static void ioctl_ring_cancel_during_write_prepare_test(void)
+{
+    ASSERT(ERROR_SUCCESS == ring_test_write_prepare_lease_case(
+        &RingTestGuidLeaseCancelWrite, 0));
+}
+
+static void ioctl_ring_reset_during_write_prepare_test(void)
+{
+    ASSERT(ERROR_SUCCESS == ring_test_write_prepare_lease_case(
+        &RingTestGuidLeaseResetWrite, 1));
+}
+
+static void ioctl_ring_stop_during_write_prepare_test(void)
+{
+    ASSERT(ERROR_SUCCESS == ring_test_write_prepare_lease_case(
+        &RingTestGuidLeaseStopWrite, 2));
+}
+
+static void ring_test_read_completion_lease_case(
+    const GUID *Guid, BOOLEAN Reset)
+{
+    RING_TEST_STATE State;
+    HANDLE DiskHandle;
+    OVERLAPPED Overlapped;
+    UINT8 ReadData[RingTestDataLength];
+    RING_TEST_COMPLETE_THREAD Complete;
+    HANDLE CompleteThread;
+    SPD_RING_HEADER *Header;
+    DWORD Error;
+
+    ring_test_create(&State, Guid, 4);
+    ring_test_wait_for_disk_manual(&State);
+    ASSERT(ERROR_SUCCESS == ring_test_retire_manual_wait(&State));
+    ASSERT(0 == ring_test_request_available(&State));
+    DiskHandle = ring_test_open_overlapped_disk(&State,
+        GENERIC_READ | GENERIC_WRITE);
+    ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    ASSERT(ResetEvent(State.CompletionCopyEntered));
+    ASSERT(ResetEvent(State.CompletionCopyRelease));
+    Error = ring_test_begin_overlapped_io(DiskHandle, FALSE,
+        RingTestBlockAddress, ReadData, sizeof ReadData, &Overlapped);
+    ASSERT(ERROR_SUCCESS == Error);
+    ASSERT(1 == ring_test_wait_for_sq_count(&State, 1));
+
+    memset(&Complete, 0, sizeof Complete);
+    Complete.State = &State;
+    Complete.Finished = CreateEventW(0, TRUE, FALSE, 0);
+    ASSERT(0 != Complete.Finished);
+    CompleteThread = CreateThread(0, 0,
+        ring_test_complete_one_thread, &Complete, 0, 0);
+    ASSERT(0 != CompleteThread);
+    ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+        State.CompletionCopyEntered, RingTestWaitTimeoutMs));
+    if (Reset)
+        ASSERT(ERROR_SUCCESS == ring_test_reset_device(DiskHandle));
+    else
+        ASSERT(CancelIoEx(DiskHandle, &Overlapped));
+    ASSERT(SetEvent(State.CompletionCopyRelease));
+    ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+        Complete.Finished, RingTestWaitTimeoutMs));
+    ASSERT(ERROR_SUCCESS == Complete.Error);
+    ASSERT(Complete.TestRead);
+    Error = ring_test_finish_overlapped_io(
+        DiskHandle, &Overlapped, RingTestWaitTimeoutMs);
+    ASSERT(ERROR_OPERATION_ABORTED == Error || ERROR_CANCELLED == Error);
+    Header = State.StorageUnit->SharedRingHeader;
+    ASSERT(0 == SpdRingLoadAcquire32(&Header->CompletionTail.Value) -
+        SpdRingLoadAcquire32(&Header->CompletionHead.Value));
+    ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
+    WaitForSingleObject(CompleteThread, RingTestWaitTimeoutMs);
+    CloseHandle(CompleteThread);
+    CloseHandle(Complete.Finished);
+    CloseHandle(Overlapped.hEvent);
+    CloseHandle(DiskHandle);
+    ring_test_destroy(&State);
+}
+
+static void ioctl_ring_cancel_during_read_copy_test(void)
+{
+    ring_test_read_completion_lease_case(
+        &RingTestGuidLeaseCancelRead, FALSE);
+}
+
+static void ioctl_ring_reset_during_read_copy_test(void)
+{
+    ring_test_read_completion_lease_case(
+        &RingTestGuidLeaseResetRead, TRUE);
+}
+
+static void ioctl_ring_batch_abort_compaction_test(void)
+{
+    enum { RequestCount = 8, CancelledCount = 1 };
+    RING_TEST_STATE State;
+    HANDLE DiskHandle;
+    OVERLAPPED Overlapped[RequestCount];
+    UINT8 ReadData[RequestCount][RingTestDataLength];
+    DWORD BytesRead;
+    SPD_RING_HEADER *Header;
+    UINT32 BaseHead;
+    UINT32 BaseTail;
+
+    ring_test_create(&State, &RingTestGuidBatchAbortCompact, 16);
+    ring_test_wait_for_disk_manual(&State);
+    ASSERT(ERROR_SUCCESS == ring_test_retire_manual_wait(&State));
+    ASSERT(0 == ring_test_request_available(&State));
+    DiskHandle = ring_test_open_overlapped_disk(&State, GENERIC_READ);
+    ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    Header = State.StorageUnit->SharedRingHeader;
+    BaseHead = SpdRingLoadAcquire32(&Header->RequestHead.Value);
+    BaseTail = SpdRingLoadAcquire32(&Header->RequestTail.Value);
+    ASSERT(BaseHead == BaseTail);
+    ASSERT(ResetEvent(State.ProducerPrepareEntered));
+    ASSERT(ResetEvent(State.ProducerPrepareRelease));
+
+    for (UINT32 I = 0; I < RequestCount; I++)
+    {
+        DWORD Error = ring_test_begin_overlapped_io(DiskHandle, FALSE,
+            RingTestBlockAddress + I, ReadData[I], sizeof ReadData[I],
+            &Overlapped[I]);
+        ASSERT(ERROR_SUCCESS == Error);
+        if (0 == I)
+            ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+                State.ProducerPrepareEntered, RingTestWaitTimeoutMs));
+    }
+    ASSERT(CancelIoEx(DiskHandle, &Overlapped[0]));
+    ASSERT(SetEvent(State.ProducerPrepareRelease));
+    ASSERT(RequestCount - CancelledCount ==
+        ring_test_wait_for_sq_count(&State,
+            RequestCount - CancelledCount));
+    ASSERT(RequestCount - CancelledCount ==
+        SpdRingLoadAcquire32(&Header->RequestTail.Value) -
+        SpdRingLoadAcquire32(&Header->RequestHead.Value));
+
+    for (UINT32 I = 0; I < RequestCount - CancelledCount; I++)
+    {
+        BOOLEAN TestRead;
+        ASSERT(0 != ring_test_request_available(&State));
+        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(
+            &State, &TestRead));
+        ASSERT(TestRead);
+    }
+    for (UINT32 I = 0; I < RequestCount; I++)
+    {
+        DWORD Error = ring_test_finish_overlapped_io(
+            DiskHandle, &Overlapped[I], RingTestWaitTimeoutMs);
+        if (0 == I)
+            ASSERT(ERROR_OPERATION_ABORTED == Error ||
+                ERROR_CANCELLED == Error);
+        else
+        {
+            ASSERT(ERROR_SUCCESS == Error);
+            ASSERT(GetOverlappedResult(DiskHandle, &Overlapped[I],
+                &BytesRead, FALSE));
+            ASSERT(RingTestDataLength == BytesRead);
+        }
+        CloseHandle(Overlapped[I].hEvent);
+    }
+    ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
+    CloseHandle(DiskHandle);
+    ring_test_destroy(&State);
+}
+
+static void ioctl_ring_full_sq_pending_resume_test(void)
+{
+    enum { QueueDepth = 8, RequestCount = 10 };
+    RING_TEST_STATE State;
+    HANDLE DiskHandle;
+    OVERLAPPED Overlapped[RequestCount];
+    UINT8 ReadData[RequestCount][RingTestDataLength];
+    SPD_RING_HEADER *Header;
+
+    ring_test_create(&State, &RingTestGuidFullSqResume, QueueDepth);
+    ring_test_wait_for_disk_manual(&State);
+    ASSERT(ERROR_SUCCESS == ring_test_retire_manual_wait(&State));
+    ASSERT(0 == ring_test_request_available(&State));
+    DiskHandle = ring_test_open_overlapped_disk(&State, GENERIC_READ);
+    ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    Header = State.StorageUnit->SharedRingHeader;
+    ASSERT(ResetEvent(State.ProducerPrepareEntered));
+    ASSERT(ResetEvent(State.ProducerPrepareRelease));
+    for (UINT32 I = 0; I < RequestCount; I++)
+    {
+        DWORD Error = ring_test_begin_overlapped_io(DiskHandle, FALSE,
+            RingTestBlockAddress + I, ReadData[I], sizeof ReadData[I],
+            &Overlapped[I]);
+        ASSERT(ERROR_SUCCESS == Error);
+        if (0 == I)
+            ASSERT(WAIT_OBJECT_0 == WaitForSingleObject(
+                State.ProducerPrepareEntered, RingTestWaitTimeoutMs));
+    }
+    ASSERT(SetEvent(State.ProducerPrepareRelease));
+    ASSERT(QueueDepth == ring_test_wait_for_sq_count(&State, QueueDepth));
+    Sleep(100);
+    ASSERT(QueueDepth ==
+        SpdRingLoadAcquire32(&Header->RequestTail.Value) -
+        SpdRingLoadAcquire32(&Header->RequestHead.Value));
+
+    for (UINT32 I = 0; I < RequestCount; I++)
+    {
+        ULONGLONG Deadline = GetTickCount64() + RingTestWaitTimeoutMs;
+        while (0 == ring_test_request_available(&State) &&
+            GetTickCount64() < Deadline)
+            Sleep(1);
+        ASSERT(0 != ring_test_request_available(&State));
+        BOOLEAN TestRead;
+        ASSERT(ERROR_SUCCESS == ring_test_complete_one_manually(
+            &State, &TestRead));
+        ASSERT(TestRead);
+    }
+    for (UINT32 I = 0; I < RequestCount; I++)
+    {
+        DWORD BytesRead = 0;
+        ASSERT(ERROR_SUCCESS == ring_test_finish_overlapped_io(
+            DiskHandle, &Overlapped[I], RingTestWaitTimeoutMs));
+        ASSERT(GetOverlappedResult(DiskHandle, &Overlapped[I],
+            &BytesRead, FALSE));
+        ASSERT(RingTestDataLength == BytesRead);
+        CloseHandle(Overlapped[I].hEvent);
+    }
+    CloseHandle(DiskHandle);
+    ring_test_destroy(&State);
+}
+
+static void ioctl_ring_multichunk_read_write_test(void)
+{
+    enum { TransferLength = 16 * 1024 };
+    RING_TEST_STATE State;
+    HANDLE DiskHandle;
+    UINT8 WriteData[TransferLength];
+    UINT8 ReadData[TransferLength];
+    LARGE_INTEGER Offset;
+    DWORD Transferred;
+    DWORD ReadCount;
+    DWORD WriteCount;
+
+    ring_test_create(&State, &RingTestGuidChunkOffsets, 64);
+    ring_test_start(&State, 8);
+    InterlockedExchange(&State.VerifyChunkOffsets, 1);
+    for (UINT32 I = 0; TransferLength > I; I++)
+        WriteData[I] = (UINT8)(RingTestBlockAddress *
+            RingTestDataLength + I);
+
+    DiskHandle = CreateFileW(State.DiskPath, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL, 0);
+    ASSERT(INVALID_HANDLE_VALUE != DiskHandle);
+    Offset.QuadPart = (LONGLONG)RingTestBlockAddress *
+        RingTestDataLength;
+    ASSERT(SetFilePointerEx(DiskHandle, Offset, 0, FILE_BEGIN));
+    InterlockedExchange(&State.WriteCallbacks, 0);
+    ASSERT(WriteFile(DiskHandle, WriteData, sizeof WriteData,
+        &Transferred, 0));
+    ASSERT(TransferLength == Transferred);
+    WriteCount = InterlockedCompareExchange(&State.WriteCallbacks, 0, 0);
+    ASSERT(4 == WriteCount);
+
+    ASSERT(SetFilePointerEx(DiskHandle, Offset, 0, FILE_BEGIN));
+    InterlockedExchange(&State.ReadCallbacks, 0);
+    ASSERT(ReadFile(DiskHandle, ReadData, sizeof ReadData,
+        &Transferred, 0));
+    ASSERT(TransferLength == Transferred);
+    ReadCount = InterlockedCompareExchange(&State.ReadCallbacks, 0, 0);
+    ASSERT(4 == ReadCount);
+    for (UINT32 I = 0; TransferLength > I; I++)
+        ASSERT((UINT8)(RingTestBlockAddress * RingTestDataLength + I) ==
+            ReadData[I]);
+
+    CloseHandle(DiskHandle);
+    ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
+    ring_test_destroy(&State);
+}
+
 static void ioctl_ring_publish_before_wait_test(void)
 {
     RING_TEST_STATE State;
@@ -2965,7 +3490,7 @@ static void ioctl_ring_producer_concurrency_test(void)
     ASSERT(RequestTail - RequestHead <= State.QueueDepth);
     ASSERT(CompletionTail - CompletionHead <= State.QueueDepth);
     ASSERT(0 == InterlockedCompareExchange(&State.Failure, 0, 0));
-    /* The Debug driver asserts ProducerExecuting <= 1 on every producer
+    /* The Debug driver asserts ProducerExecuting <= 1 on every worker
      * section, and RingClose checks its live refs and ActiveCalls. */
     ring_test_destroy(&State);
 }
@@ -3180,6 +3705,14 @@ void ring_tests(void)
     TEST(ioctl_ring_stop_with_workers_active_test);
     TEST(ioctl_ring_wait_notification_test);
 #if defined(WINSPD_TEST_BUILD)
+    TEST(ioctl_ring_cancel_during_write_prepare_test);
+    TEST(ioctl_ring_reset_during_write_prepare_test);
+    TEST(ioctl_ring_stop_during_write_prepare_test);
+    TEST(ioctl_ring_cancel_during_read_copy_test);
+    TEST(ioctl_ring_reset_during_read_copy_test);
+    TEST(ioctl_ring_batch_abort_compaction_test);
+    TEST(ioctl_ring_full_sq_pending_resume_test);
+    TEST(ioctl_ring_multichunk_read_write_test);
     TEST(ioctl_ring_publish_before_wait_test);
     TEST(ioctl_ring_post_cancel_race_test);
     TEST(ioctl_ring_producer_concurrency_test);
