@@ -155,6 +155,35 @@ typedef struct
     SPD_IOCTL_DECLSPEC_ALIGN UINT16 Size;
     UINT16 Code;
 } SPD_IOCTL_BASE_PARAMS;
+#if defined(WINSPD_TEST_BUILD)
+/* Private test control; absent from Release and unrelated to SQ/CQ ABI. */
+#define SPD_IOCTL_TEST_CANCEL          0x8001
+#define SPD_IOCTL_TEST_RESET           0x8002
+#define SPD_IOCTL_TEST_EXHAUST_GENERATION 0x8003
+#define SPD_IOCTL_TEST_PROMOTE_FLUSH    0x8004
+#define SPD_IOCTL_TEST_NONCDB_HELPERS   0x8005
+#define SPD_IOCTL_TEST_NONCDB_SEEN      0x8006
+#define SPD_IOCTL_TEST_EXPECT_CHUNKED   0x8007
+#define SPD_IOCTL_TEST_EXPECT_FENCE     0x8008
+#define SPD_IOCTL_TEST_EXPECT_PENDING   0x8009
+#define SPD_IOCTL_TEST_CHUNK_LIMIT      0x800a
+#define SPD_IOCTL_TEST_COPY_BUDGET      0x800b
+#define SPD_IOCTL_TEST_LEGACY_CHUNKS    0x800c
+#define SPD_TEST_CANCEL_PREPARING      1
+#define SPD_TEST_CANCEL_COMPLETING     2
+#define SPD_TEST_CANCEL_INFLIGHT       3
+#define SPD_TEST_CANCEL_READY          4
+#define SPD_TEST_CANCEL_COMPLETION_QUEUED 5
+#define SPD_TEST_CANCEL_PENDING        6
+typedef struct
+{
+    SPD_IOCTL_BASE_PARAMS Base;
+    UINT32 Btl;
+    UINT64 BlockAddress;
+    UINT32 Kind;
+    UINT32 ExpectedState;
+} SPD_IOCTL_TEST_CANCEL_PARAMS;
+#endif
 typedef struct
 {
     SPD_IOCTL_BASE_PARAMS Base;
@@ -205,9 +234,9 @@ typedef struct
     UINT32 ProcessId;
 } SPD_IOCTL_SET_TRANSACT_PID_PARAMS;
 
-/* SharedRing V4 transports, but does not redefine, the canonical WinSpd
+/* SharedRing V5 transports, but does not redefine, the canonical WinSpd
  * transaction request and response structures above. */
-#define SPD_RING_VERSION                4
+#define SPD_RING_VERSION                5
 #define SPD_RING_CACHE_LINE_SIZE        64
 #define SPD_RING_MIN_QUEUE_DEPTH        2
 #define SPD_RING_MAX_QUEUE_DEPTH        4096
@@ -219,9 +248,11 @@ typedef struct
 {
     UINT32 BufferId;
     UINT32 Length;
+    /* V5: optional backend-process VA; BufferId still identifies the slot. */
+    UINT64 UserAddress;
 } SPD_RING_BUFFER_REF;
 #if defined(WINSPD_SYS_INTERNAL)
-static_assert(8 == sizeof(SPD_RING_BUFFER_REF),
+static_assert(16 == sizeof(SPD_RING_BUFFER_REF),
     "unexpected SPD_RING_BUFFER_REF size");
 #endif
 
@@ -267,6 +298,7 @@ typedef struct
     UINT32 QueueDepth;
     UINT32 BufferCount;
     UINT32 BufferSize;
+    UINT32 MapThresholdBytes;
     SPD_RING_CURSOR RequestHead;
     SPD_RING_CURSOR RequestTail;
     SPD_RING_CURSOR CompletionHead;

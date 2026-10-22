@@ -227,6 +227,7 @@
       <PrecompiledHeader>
       </PrecompiledHeader>
       <Optimization Condition="'$(Configuration)'=='Release'">MaxSpeed</Optimization>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
       <FunctionLevelLinking Condition="'$(Configuration)'=='Release'">true</FunctionLevelLinking>
       <IntrinsicFunctions Condition="'$(Configuration)'=='Release'">true</IntrinsicFunctions>
       <PreprocessorDefinitions Condition="'$(Configuration)'=='Debug'">_DEBUG;_WINDOWS;_USRDLL;WINSPD_DLL_EXPORTS;WINSPD_TEST_BUILD;%(PreprocessorDefinitions)</PreprocessorDefinitions>

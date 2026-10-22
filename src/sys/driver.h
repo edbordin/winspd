@@ -212,6 +212,8 @@ FORCEINLINE VOID SpdSrbComplete(PVOID DeviceExtension, PVOID Srb, UCHAR SrbStatu
     StorPortNotification(RequestComplete, DeviceExtension, Srb);
 }
 UCHAR SpdSrbExecuteScsi(PVOID DeviceExtension, PVOID Srb);
+UCHAR SpdSrbPostFlush(PVOID DeviceExtension, PVOID Srb);
+BOOLEAN SpdSrbIsFlush(PVOID Srb);
 VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension, PVOID Context, PVOID DataBuffer);
 UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension, PVOID Context, PVOID DataBuffer);
 UCHAR SpdSrbAbortCommand(PVOID DeviceExtension, PVOID Srb);
@@ -318,18 +320,93 @@ retry:
     return Result;
 }
 
+/* Fixed storage; stage histograms can have concurrent thread writers. */
+#define SPD_HISTOGRAM_BUCKETS 64
+typedef struct
+{
+    UINT64 Bins[SPD_HISTOGRAM_BUCKETS];
+} SPD_HISTOGRAM;
+
+FORCEINLINE VOID SpdHistogramRecord(SPD_HISTOGRAM *Histogram, UINT64 Value)
+{
+    ULONG Bucket = 0;
+    while (Value > 1 && Bucket + 1 < SPD_HISTOGRAM_BUCKETS)
+    {
+        Value = (Value >> 1) + (Value & 1);
+        Bucket++;
+    }
+    InterlockedIncrement64((volatile LONG64 *)&Histogram->Bins[Bucket]);
+}
+VOID SpdHistogramLog(const SPD_HISTOGRAM *Histogram, PCSTR Name);
+
+/* Optional latency diagnostics support parallel stage writers without per-I/O
+ * logging/allocation. Read/log only after callback rundown. */
+#ifndef SPD_RING_LATENCY_DIAGNOSTICS
+#define SPD_RING_LATENCY_DIAGNOSTICS 0
+#endif
+typedef enum
+{
+    SpdLatencyPending, SpdLatencyPrepare, SpdLatencyReady, SpdLatencyFlight,
+    SpdLatencyCqQueue, SpdLatencyCompletionBatchWait, SpdLatencyCompletionService,
+    SpdLatencyCompletionRetireWait, SpdLatencyNotifyWait, SpdLatencyNotifyService,
+    SpdLatencyKernelTotal, SpdLatencyCqNotify, SpdLatencyCompletionEnqueueLock,
+    SpdLatencyCompletionClaimLock, SpdLatencyCompletionRetireLock, SpdLatencyPreparationDispatch, SpdLatencyProducerDispatch,
+    SpdLatencyCompletionDispatch, SpdLatencyKick, SpdLatencyCompletionBacklog,
+    SpdLatencyCqDepth, SpdLatencyCount
+} SPD_LATENCY_STAGE;
+typedef struct
+{
+    SPD_HISTOGRAM Histogram;
+    UINT64 Count, Total, Maximum;
+} SPD_LATENCY_METRIC;
+FORCEINLINE VOID SpdLatencyRecord(SPD_LATENCY_METRIC *Metric, UINT64 Value)
+{
+    SpdHistogramRecord(&Metric->Histogram, Value);
+    InterlockedIncrement64((volatile LONG64 *)&Metric->Count);
+    InterlockedExchangeAdd64((volatile LONG64 *)&Metric->Total, Value);
+    UINT64 Previous = InterlockedCompareExchange64((volatile LONG64 *)&Metric->Maximum, 0, 0);
+    while (Value > Previous)
+    {
+        UINT64 Observed = InterlockedCompareExchange64(
+            (volatile LONG64 *)&Metric->Maximum, Value, Previous);
+        if (Observed == Previous)
+            break;
+        Previous = Observed;
+    }
+}
+VOID SpdLatencyLog(const SPD_LATENCY_METRIC *Metric, PCSTR Name, BOOLEAN IsDepth);
+typedef struct
+{
+    UINT64 CqTicks, AcceptedTicks, RetiredTicks;
+} SPD_RING_RETIRE_TIMING;
+
 /* I/O queue */
 typedef struct
 {
     PVOID DeviceExtension;
+    struct _SPD_STORAGE_UNIT *StorageUnit;
     KSPIN_LOCK SpinLock;
     volatile LONG64 SpinLockWaitTicks;
     volatile LONG64 SpinLockHoldTicks;
     volatile LONG64 SpinLockAcquisitions;
+    SPD_HISTOGRAM SpinLockWaitHistogram, SpinLockHoldHistogram;
+    UINT64 AcceptedSrbs, RetiredSrbs;
+#if SPD_RING_LATENCY_DIAGNOSTICS
+    UINT32 CompletionQueuedCount;
+#endif
     BOOLEAN Stopped;
+    BOOLEAN RingClosing;
+    ULONG ResetOwners;
     BOOLEAN NonblockingConsumer;
+    BOOLEAN FlushInProgress;
+    ULONG ActiveSrbs;
     SPD_QEVENT PendingEvent;
     LIST_ENTRY PendingList, ProcessList;
+    /* Shared transport metadata, all protected by SpinLock. ProcessList and
+     * ProcessBuckets below belong exclusively to the legacy transport. */
+    struct _SPD_WORK_SLOT *Slots;
+    UINT32 SlotCount;
+    LIST_ENTRY FreeSlots, ReadySlots, CompletedSlots;
     ULONG ProcessBucketCount;
     PVOID ProcessBuckets[];
 } SPD_IOQ;
@@ -348,17 +425,36 @@ typedef enum
 
 NTSTATUS SpdIoqCreate(PVOID DeviceExtension, SPD_IOQ **PIoq);
 VOID SpdIoqDelete(SPD_IOQ *Ioq);
-VOID SpdIoqSetNonblockingConsumer(SPD_IOQ *Ioq);
+NTSTATUS SpdIoqRingAttachSlots(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT *Slots, UINT32 Count);
+struct _SPD_WORK_SLOT *SpdIoqRingDetachSlots(SPD_IOQ *Ioq);
+VOID SpdIoqRingBeginClose(SPD_IOQ *Ioq);
 VOID SpdIoqReset(SPD_IOQ *Ioq, BOOLEAN Stop,
     SPD_IOQ_RESET_REASON Reason);
 BOOLEAN SpdIoqStopped(SPD_IOQ *Ioq);
 VOID SpdIoqLogDiagnostics(SPD_IOQ *Ioq);
+VOID SpdStorageUnitRingTerminalReset(struct _SPD_STORAGE_UNIT *StorageUnit);
 NTSTATUS SpdIoqCancelSrb(SPD_IOQ *Ioq, PVOID Srb);
+#if defined(WINSPD_TEST_BUILD)
+NTSTATUS SpdIoqTestCancel(SPD_IOQ *Ioq, UINT32 Kind,
+    UINT64 BlockAddress, UINT32 ExpectedState);
+BOOLEAN SpdSrbTestMatchesRange(PVOID Srb, UINT32 Kind, UINT64 BlockAddress);
+NTSTATUS SpdIoqTestExhaustGeneration(SPD_IOQ *Ioq);
+NTSTATUS SpdIoqTestPromoteFlush(SPD_IOQ *Ioq, UINT64 BlockAddress);
+NTSTATUS SpdIoqTestExpectChunked(SPD_IOQ *Ioq, UINT64 BlockAddress);
+NTSTATUS SpdIoqTestExpectFence(SPD_IOQ *Ioq);
+NTSTATUS SpdIoqTestExpectPending(SPD_IOQ *Ioq, UINT32 Kind, UINT64 BlockAddress);
+NTSTATUS SpdIoqTestSetChunkLimit(SPD_IOQ *Ioq, UINT32 Limit);
+NTSTATUS SpdIoqTestCopyBudget(SPD_IOQ *Ioq);
+NTSTATUS SpdSrbTestNonCdbHelpers(struct _SPD_STORAGE_UNIT *StorageUnit);
+#endif
 struct _SPD_STORAGE_UNIT;
 struct _SPD_SRB_EXTENSION;
 VOID SpdStorageUnitRingTestPrepareCopyBarrier(
     struct _SPD_STORAGE_UNIT *StorageUnit);
 VOID SpdStorageUnitRingTestCompletionCopyBarrier(
+    struct _SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingTestResetRetireBarrier(
     struct _SPD_STORAGE_UNIT *StorageUnit);
 /*
  * Caller must hold a live StorageUnit reference
@@ -368,21 +464,27 @@ NTSTATUS SpdIoqPostSrb(struct _SPD_STORAGE_UNIT *StorageUnit, PVOID Srb);
 NTSTATUS SpdIoqTryStartProcessingSrb(SPD_IOQ *Ioq,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
-NTSTATUS SpdIoqRingClaimSrb(SPD_IOQ *Ioq,
-    struct _SPD_SRB_EXTENSION **PSrbExtension);
-VOID SpdIoqRingAcquireCommitLock(SPD_IOQ *Ioq, KIRQL *PIrql,
-    LARGE_INTEGER *PStart);
-VOID SpdIoqRingReleaseCommitLock(SPD_IOQ *Ioq, KIRQL Irql,
-    LARGE_INTEGER Start);
-BOOLEAN SpdIoqRingCommitPreparedSrbNoLock(SPD_IOQ *Ioq,
-    struct _SPD_SRB_EXTENSION *SrbExtension, BOOLEAN AbortAll,
-    PVOID *PSrb, BOOLEAN *PAbortRequested);
-NTSTATUS SpdIoqRingClaimCompletion(SPD_IOQ *Ioq, UINT64 Hint,
-    struct _SPD_SRB_EXTENSION **PSrbExtension);
-NTSTATUS SpdIoqRingFinishCompletion(SPD_IOQ *Ioq,
-    struct _SPD_SRB_EXTENSION *SrbExtension, UCHAR SrbStatus);
+NTSTATUS SpdIoqRingClaimBatch(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT **Slots, UINT32 Limit, UINT32 CopyByteLimit, UINT32 *PCount);
+UINT32 SpdIoqRingCommitBatch(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT **Slots, SPD_RING_REQUEST *Requests, UINT32 Count,
+    BOOLEAN AbortAll, PVOID *AbortedSrbs, BOOLEAN *PQueueCleanup);
+UINT32 SpdIoqRingPublishBatch(SPD_IOQ *Ioq, UINT32 Limit,
+    BOOLEAN *PInvalidHead);
+NTSTATUS SpdIoqRingEnqueueCompletions(SPD_IOQ *Ioq,
+    const SPD_RING_COMPLETION *Completions, UINT32 Count, UINT32 *PAccepted);
+UINT32 SpdIoqRingClaimCompletedBatch(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT **Slots, UINT32 Limit);
+UINT32 SpdIoqRingFinishCompletedBatch(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT **Slots, UCHAR *Statuses, UINT32 Count,
+    PVOID *Srbs, UCHAR *FinalStatuses, SPD_RING_RETIRE_TIMING *Timings);
+BOOLEAN SpdIoqRingHasCompleted(SPD_IOQ *Ioq);
+UINT32 SpdIoqRingClaimMappedCleanup(SPD_IOQ *Ioq,
+    struct _SPD_WORK_SLOT **Slots, UINT32 Limit);
 ULONG SpdIoqRingLeasedCount(SPD_IOQ *Ioq);
 BOOLEAN SpdIoqRingHasPending(SPD_IOQ *Ioq);
+BOOLEAN SpdIoqRingHasReady(SPD_IOQ *Ioq);
+UINT32 SpdSrbPreparationCopyBytes(struct _SPD_SRB_EXTENSION *Extension);
 NTSTATUS SpdIoqStartProcessingSrb(SPD_IOQ *Ioq, PLARGE_INTEGER Timeout, PIRP CancellableIrp,
     VOID (*Prepare)(PVOID SrbExtension, PVOID Context, PVOID DataBuffer),
     PVOID Context, PVOID DataBuffer);
@@ -398,8 +500,12 @@ typedef enum
     SpdRingSrbNone = 0,
     SpdRingSrbPending,
     SpdRingSrbPreparing,
+    SpdRingSrbReady,
     SpdRingSrbInFlight,
-    SpdRingSrbCompleting
+    SpdRingSrbCompletionQueued,
+    SpdRingSrbCompleting,
+    /* Detached from admission/processing; owned by a reset retirement batch. */
+    SpdRingSrbRetiring
 } SPD_RING_SRB_STATE;
 
 typedef struct _SPD_SRB_EXTENSION
@@ -409,30 +515,132 @@ typedef struct _SPD_SRB_EXTENSION
     PVOID HashNext;
     PVOID Srb;
     PVOID SystemDataBuffer;
+    PMDL OriginalMdl; /* Borrowed from Storport; never unlock/free. */
+    BOOLEAN MappingCandidate;
     ULONG SystemDataLength;
     ULONG ChunkOffset;
+    UINT64 PendingTicks;
+#if SPD_RING_LATENCY_DIAGNOSTICS
+    UINT64 AcceptedTicks;
+#endif
     SPD_RING_SRB_STATE RingState;
     BOOLEAN RingAbortPending;
+    BOOLEAN RingIsFlush;
+    BOOLEAN ExecutionStarted;
+    struct _SPD_WORK_SLOT *Slot;
 } SPD_SRB_EXTENSION;
 #define SpdSrbExtension(Srb)            ((SPD_SRB_EXTENSION *)SrbGetMiniportContext(Srb))
 
-typedef struct
+typedef enum
 {
-    UINT64 OwnerHint;
-    UINT32 Length;
-    UINT8 Kind;
-    UINT8 Allocated;
-    UINT16 Reserved;
-} SPD_RING_BUFFER_META;
+    SpdSlotFree,
+    SpdSlotPreparing,
+    SpdSlotReady,
+    SpdSlotInFlight,
+    SpdSlotCompletionQueued,
+    SpdSlotCompleting
+} SPD_SLOT_STATE;
 
-typedef struct
+typedef struct _SPD_WORK_SLOT
 {
-    UINT32 *FreeIds;
-    UINT32 FreeCount;
-    SPD_RING_BUFFER_META *Meta;
-} SPD_RING_BUFFER_POOL;
+    LIST_ENTRY ListEntry;
+    SPD_SRB_EXTENSION *Srb;
+    UINT64 RequestId;
+    SPD_SLOT_STATE State;
+    BOOLEAN CancelRequested;
+    BOOLEAN MappingLease; /* Cleanup must run outside the metadata lock. */
+    PMDL MappingMdl;
+    PVOID MappedUserAddress;
+    SPD_IOCTL_TRANSACT_REQ Request;
+    SPD_IOCTL_TRANSACT_RSP Response;
+    UINT32 DataLength;
+    UINT64 PreparingTicks, ReadyTicks, PublishedTicks, CqTicks;
+#if SPD_RING_LATENCY_DIAGNOSTICS
+    UINT64 CompletionClaimTicks, CompletionServiceEnd;
+#endif
+} SPD_WORK_SLOT;
 
-/* ProducerState owns one producer lifetime reference while ACTIVE/RERUN. */
+#ifndef SPD_RING_MAP_THRESHOLD_BYTES
+#define SPD_RING_MAP_THRESHOLD_BYTES 0
+#endif
+#ifndef SPD_RING_MAP_ORIGIN_DIAGNOSTICS
+#define SPD_RING_MAP_ORIGIN_DIAGNOSTICS 0
+#endif
+
+/* Change only IOQ lock acquisition, preserving all metadata ownership rules. */
+#ifndef SPD_IOQ_QUEUED_SPIN_LOCK
+#define SPD_IOQ_QUEUED_SPIN_LOCK 0
+#endif
+#if SPD_IOQ_QUEUED_SPIN_LOCK != 0 && SPD_IOQ_QUEUED_SPIN_LOCK != 1
+#error IOQ queued spin lock selector must be 0 or 1.
+#endif
+
+#define SPD_RING_COMPLETION_LIMIT 32
+#ifndef SPD_RING_COMPLETION_CLAIM_LIMIT
+#define SPD_RING_COMPLETION_CLAIM_LIMIT 32
+#endif
+#if SPD_RING_COMPLETION_CLAIM_LIMIT < 1 || SPD_RING_COMPLETION_CLAIM_LIMIT > 32
+#error Completion claim limit must be between 1 and 32.
+#endif
+#define SPD_RING_PUBLISH_LIMIT 32
+
+/* Keep execution-context experiments independent of queue/slot ownership. */
+#ifndef SPD_RING_THREAD_PRIORITY
+#define SPD_RING_THREAD_PRIORITY 8
+#endif
+/* Restrict this experiment to Normal and Delayed worker priorities. */
+#if SPD_RING_THREAD_PRIORITY != 8 && SPD_RING_THREAD_PRIORITY != 12
+#error Ring thread priority must be 8 (Normal) or 12 (Delayed).
+#endif
+#ifndef SPD_RING_PREPARATION_THREAD
+#define SPD_RING_PREPARATION_THREAD 0
+#endif
+#ifndef SPD_RING_COMPLETION_THREAD
+#define SPD_RING_COMPLETION_THREAD 0
+#endif
+#ifndef SPD_RING_PREPARATION_THREADS
+#define SPD_RING_PREPARATION_THREADS 1
+#endif
+#ifndef SPD_RING_COMPLETION_THREADS
+#define SPD_RING_COMPLETION_THREADS 1
+#endif
+#if SPD_RING_PREPARATION_THREADS < 1 || SPD_RING_PREPARATION_THREADS > 4 || SPD_RING_COMPLETION_THREADS < 1 || SPD_RING_COMPLETION_THREADS > 4
+#error Ring thread counts must be between 1 and 4 per stage.
+#endif
+#if (SPD_RING_PREPARATION_THREAD != 0 && SPD_RING_PREPARATION_THREAD != 1) || (SPD_RING_COMPLETION_THREAD != 0 && SPD_RING_COMPLETION_THREAD != 1)
+#error Ring thread selectors must be 0 (work item) or 1 (dedicated thread).
+#endif
+#if (SPD_RING_PREPARATION_THREAD || SPD_RING_COMPLETION_THREAD) && NTDDI_VERSION < NTDDI_WIN10_FE
+#error Dedicated ring threads require NTDDI_WIN10_FE or later for Storport thread APIs.
+#endif
+typedef struct _SPD_RING_THREAD SPD_RING_THREAD;
+
+#ifndef SPD_RING_CLAIM_LIMIT
+#define SPD_RING_CLAIM_LIMIT 32
+#endif
+/* Claim and commit limits are deliberately independent tuning parameters. */
+#ifndef SPD_RING_PREPARE_COPY_LIMIT
+#define SPD_RING_PREPARE_COPY_LIMIT (1024 * 1024)
+#endif
+#ifndef SPD_RING_READY_COMMIT_LIMIT
+#define SPD_RING_READY_COMMIT_LIMIT 8
+#endif
+#ifndef SPD_RING_READY_COPY_LIMIT
+#define SPD_RING_READY_COPY_LIMIT (256 * 1024)
+#endif
+#ifndef SPD_RING_PREPARE_TIME_US
+#define SPD_RING_PREPARE_TIME_US 100
+#endif
+#define SPD_SLOT_GENERATION_MAX 0x0000ffffffffffffULL
+
+#if SPD_RING_CLAIM_LIMIT < 1 || SPD_RING_CLAIM_LIMIT > 32
+#error Preparation claim limit must be between 1 and 32.
+#endif
+#if SPD_RING_PREPARE_COPY_LIMIT < 1 || SPD_RING_READY_COMMIT_LIMIT < 1 || SPD_RING_READY_COPY_LIMIT < 1 || SPD_RING_PREPARE_TIME_US < 1
+#error Preparation copy, commit and time budgets must be positive.
+#endif
+
+/* Each stage state owns one lifetime reference while ACTIVE/RERUN. */
 #define SPD_RING_PRODUCER_IDLE     0L
 #define SPD_RING_PRODUCER_ACTIVE   1L
 #define SPD_RING_PRODUCER_RERUN    2L
@@ -450,16 +658,36 @@ typedef struct
     UINT32 BufferSize;
     UINT32 RequestTail;
     UINT32 CompletionHead;
-    SPD_RING_BUFFER_POOL Buffers;
     KSPIN_LOCK Lock;
     PVOID volatile WaitIrp;
     PVOID ProducerWorker;
-    SPD_SRB_EXTENSION **ProducerClaims;
-    PVOID *ProducerAbortedSrbs;
+    /* A device work item hands off retries while Storport still owns Worker. */
+    PIO_WORKITEM ProducerRetryWorker;
+    BOOLEAN ProducerRetryQueued;
     volatile LONG ProducerState;
 #if DBG
     volatile LONG ProducerExecuting;
     volatile LONG ProducerLiveReferences;
+#endif
+    PVOID PreparationWorker;
+    SPD_RING_THREAD *PreparationThread;
+    /* A device work item hands off retries while Storport still owns Worker. */
+    PIO_WORKITEM PreparationRetryWorker;
+    BOOLEAN PreparationRetryQueued;
+    volatile LONG PreparationState;
+#if DBG
+    volatile LONG PreparationExecuting;
+    volatile LONG PreparationLiveReferences;
+#endif
+    PVOID CompletionWorker;
+    SPD_RING_THREAD *CompletionThread;
+    /* A device work item hands off retries while Storport still owns Worker. */
+    PIO_WORKITEM CompletionRetryWorker;
+    BOOLEAN CompletionRetryQueued;
+    volatile LONG CompletionState;
+#if DBG
+    volatile LONG CompletionExecuting;
+    volatile LONG CompletionLiveReferences;
 #endif
 #if defined(WINSPD_TEST_BUILD)
     PKEVENT TestIoqPostEnteredEvent;
@@ -469,6 +697,13 @@ typedef struct
     PKEVENT TestProducerPrepareReleaseEvent;
     PKEVENT TestCompletionCopyEnteredEvent;
     PKEVENT TestCompletionCopyReleaseEvent;
+    PKEVENT TestCompletionClaimEnteredEvent;
+    PKEVENT TestCompletionClaimReleaseEvent;
+    PKEVENT TestPrepareCommitEnteredEvent;
+    PKEVENT TestPrepareCommitReleaseEvent;
+    PKEVENT TestReadyEnteredEvent;
+    PKEVENT TestReadyReleaseEvent;
+    PKEVENT TestPreparationClaimReleaseEvent;
     volatile LONG TestIoqPostBarrierActive;
 #endif
     volatile LONG KickActive;
@@ -476,6 +711,8 @@ typedef struct
     BOOLEAN Failed;
     ULONG ActiveCalls;
     KEVENT IdleEvent;
+    volatile LONG CloseState;
+    KEVENT CloseDoneEvent;
     ULONG ProcessId;
     volatile LONG64 SqFullEvents;
     volatile LONG64 BufferPoolExhaustions;
@@ -483,16 +720,54 @@ typedef struct
     volatile LONG64 WaitCompletions;
     volatile LONG64 ProducerWorkerRuns;
     volatile LONG64 ProducerWorkerReruns;
+    volatile LONG64 ProducerContinuations;
+    volatile LONG64 ProducerBusyDeferrals;
+    volatile LONG64 PreparationWorkerRuns;
+    volatile LONG64 PreparationWorkerReruns;
+    volatile LONG64 PreparationContinuations;
+    volatile LONG64 PreparationBusyDeferrals;
+    volatile LONG64 PreparationClaimed;
+    volatile LONG64 PreparationCommits;
+    volatile LONG64 PreparationCallbackTicks;
+    volatile LONG PreparationMaxClaim;
+    volatile LONG64 CompletionWorkerRuns;
+    volatile LONG64 CompletionWorkerReruns;
+    volatile LONG64 CompletionContinuations;
+    volatile LONG64 CompletionBusyDeferrals;
+    volatile LONG64 CompletionClaimed;
+    volatile LONG64 CompletionCallbackTicks;
+    volatile LONG CompletionMaxClaim;
+    volatile LONG PreparationOwnedBatches, CompletionOwnedBatches;
+    volatile LONG PreparationMaxOwnedBatches, CompletionMaxOwnedBatches;
     volatile LONG64 ProducerProduced;
     volatile LONG64 ProducerBatchLe1;
     volatile LONG64 ProducerBatch2To4;
     volatile LONG64 ProducerBatch5To16;
     volatile LONG64 ProducerBatch17To64;
     volatile LONG64 ProducerBatchOver64;
-    volatile LONG64 ProducerPrepareTicks;
+    volatile LONG64 PreparationCopyTicks;
+    volatile LONG64 MapAttempts, MapSuccesses, MapFallbacks, MapUnmaps;
+    volatile LONG64 MapOriginSamples, MapOriginUser, MapOriginKernel;
+    volatile LONG64 MapOriginUnknown, MapOriginSelf;
+    volatile LONG64 MapBytes, MapTicks, UnmapTicks;
+    volatile LONG MapSourceFlagsOr;
     volatile LONG64 CompletionCopyTicks;
     volatile LONG64 DeferredSrbAborts;
+    UINT64 PreparationClaimCopyBytes, PreparationOversizedClaims, PreparationCopyBudgetViolations;
+    volatile LONG64 NonCdbFlushSubmissions;
+    volatile LONG64 ShutdownSubmissions;
     volatile LONG ProducerMaxBatch;
+    SPD_HISTOGRAM PendingToPreparing, PreparingToReady, ReadyToSq;
+    SPD_HISTOGRAM CqToRetire, CqToComplete, FlushRoundTrip;
+    SPD_HISTOGRAM PreparationDuration, CompletionDuration;
+    UINT64 PreparationClaimSizes[SPD_RING_CLAIM_LIMIT + 1];
+    UINT64 PreparationCommitSizes[SPD_RING_CLAIM_LIMIT + 1];
+    UINT64 CompletionClaimSizes[SPD_RING_COMPLETION_CLAIM_LIMIT + 1];
+#if SPD_RING_LATENCY_DIAGNOSTICS
+    SPD_LATENCY_METRIC Latency[SpdLatencyCount];
+    volatile LONG64 PreparationQueuedTicks, ProducerQueuedTicks, CompletionQueuedTicks;
+    volatile LONG64 KickCalls, KickBusy;
+#endif
 
     /* Ring lifetime and mapping state. */
     HANDLE SectionHandle;
@@ -514,6 +789,15 @@ typedef struct _SPD_DEVICE_EXTENSION
     KSPIN_LOCK SpinLock;
     PDEVICE_OBJECT DeviceObject;        /* adapter device */
     ULONG StorageUnitCount, StorageUnitCapacity;
+    ULONG RundownWorkers;
+    /* Immutable after HwInitialize; report queried and successfully applied
+     * completion performance options separately from the requested build mode. */
+    ULONG CompletionPerfMode, CompletionPerfVersion;
+    ULONG CompletionPerfQueryStatus, CompletionPerfApplyStatus;
+    ULONG CompletionPerfSupported, CompletionPerfRequested, CompletionPerfApplied;
+    KEVENT RundownIdleEvent;
+    /* Removed units reserve their address until physical ring rundown. */
+    SPD_STORAGE_UNIT *RetiringUnits[SPD_IOCTL_STORAGE_UNIT_MAX_CAPACITY];
     SPD_STORAGE_UNIT *StorageUnits[];
 } SPD_DEVICE_EXTENSION;
 typedef struct _SPD_STORAGE_UNIT
@@ -524,11 +808,21 @@ typedef struct _SPD_STORAGE_UNIT
     SPD_IOCTL_STORAGE_UNIT_PARAMS StorageUnitParams;
     CHAR SerialNumber[36];
     ULONG OwnerProcessId;
+    PEPROCESS OwnerProcess;
     UINT32 Btl;
     SPD_IOQ *Ioq;
     /* fields not protected */
     PDEVICE_OBJECT DeviceObject;        /* disk device */
     ULONG TransactProcessId;
+    /* Set once during OPEN under Ring.Lock; references live until deletion. */
+    PEPROCESS RingProcess;
+    PFILE_OBJECT RingFileObject;
+    PIO_WORKITEM RundownWorker;
+#if defined(WINSPD_TEST_BUILD)
+    UINT32 TestChunkLimit;
+    volatile LONG TestLegacyContinuations;
+    PKEVENT TestOwnerRundownDoneEvent;
+#endif
     SPD_RING_STATE Ring;
 } SPD_STORAGE_UNIT;
 NTSTATUS SpdDeviceExtensionInit(SPD_DEVICE_EXTENSION *DeviceExtension, PVOID BusInformation);
@@ -547,6 +841,7 @@ NTSTATUS SpdStorageUnitUnprovision(
 NTSTATUS SpdStorageUnitRingOpen(
     SPD_STORAGE_UNIT *StorageUnit,
     ULONG ProcessId,
+    PFILE_OBJECT FileObject,
     SPD_IOCTL_RING_OPEN_PARAMS *Params);
 VOID SpdStorageUnitRingClose(
     SPD_STORAGE_UNIT *StorageUnit,
@@ -560,6 +855,8 @@ SPD_SERVICE_IRP_DISPOSITION SpdStorageUnitRingWait(
     SPD_IOCTL_RING_WAIT_PARAMS *Params,
     PIRP Irp);
 VOID SpdStorageUnitRingScheduleProducer(SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingSchedulePreparation(SPD_STORAGE_UNIT *StorageUnit);
+VOID SpdStorageUnitRingScheduleCompletion(SPD_STORAGE_UNIT *StorageUnit);
 #if defined(WINSPD_TEST_BUILD)
 VOID SpdStorageUnitRingTestIoqPostBarrier(
     SPD_STORAGE_UNIT *StorageUnit);
@@ -574,6 +871,8 @@ NTSTATUS SpdStorageUnitRingKick(
 SPD_STORAGE_UNIT *SpdStorageUnitReferenceByBtl(
     SPD_DEVICE_EXTENSION *DeviceExtension,
     UINT32 Btl);
+SPD_STORAGE_UNIT *SpdStorageUnitReferenceForClose(
+    SPD_DEVICE_EXTENSION *DeviceExtension, UINT32 Btl);
 VOID SpdStorageUnitDereference(
     SPD_DEVICE_EXTENSION *DeviceExtension,
     SPD_STORAGE_UNIT *StorageUnit);
@@ -596,6 +895,7 @@ SPD_STORAGE_UNIT *SpdStorageUnitReference(PVOID DeviceExtension, PVOID Srb)
     return SpdStorageUnitReferenceByBtl(DeviceExtension, SPD_IOCTL_BTL(PathId, TargetId, Lun));
 }
 extern ERESOURCE SpdGlobalDeviceResource;
+extern KMUTEX SpdGlobalDeviceLifecycleMutex;
 extern SPD_DEVICE_EXTENSION *SpdGlobalDeviceExtension;  /* protected by SpdGlobalDeviceResource */
 extern ULONG SpdStorageUnitCapacity;                    /* read-only after DriverLoad */
 #define SPD_INDEX_FROM_BTL(Btl)         SPD_IOCTL_BTL_T(Btl)

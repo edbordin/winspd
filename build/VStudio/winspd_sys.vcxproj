@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="12.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="version.properties" />
   <ItemGroup Label="ProjectConfigurations">
@@ -81,6 +81,26 @@
   <ImportGroup Label="PropertySheets">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
+  <PropertyGroup Label="RingTuning">
+    <RingMapThresholdBytes Condition="'$(RingMapThresholdBytes)'==''">0</RingMapThresholdBytes>
+    <RingMapOriginDiagnostics Condition="'$(RingMapOriginDiagnostics)'==''">0</RingMapOriginDiagnostics>
+    <IoqQueuedSpinLock Condition="'$(IoqQueuedSpinLock)'==''">0</IoqQueuedSpinLock>
+    <RingThreadPriority Condition="'$(RingThreadPriority)'==''">8</RingThreadPriority>
+    <RingPreparationThread Condition="'$(RingPreparationThread)'==''">0</RingPreparationThread>
+    <RingCompletionThread Condition="'$(RingCompletionThread)'==''">0</RingCompletionThread>
+    <RingPreparationThreads Condition="'$(RingPreparationThreads)'==''">1</RingPreparationThreads>
+    <RingCompletionThreads Condition="'$(RingCompletionThreads)'==''">1</RingCompletionThreads>
+    <RingCompletionClaimLimit Condition="'$(RingCompletionClaimLimit)'==''">32</RingCompletionClaimLimit>
+    <RingTargetNtddi>0x0A000008</RingTargetNtddi>
+    <RingTargetNtddi Condition="'$(RingPreparationThread)'=='1' Or '$(RingCompletionThread)'=='1'">0x0A00000A</RingTargetNtddi>
+    <RingCompletionDpcMode Condition="'$(RingCompletionDpcMode)'==''">0</RingCompletionDpcMode>
+    <RingLatencyDiagnostics Condition="'$(RingLatencyDiagnostics)'==''">0</RingLatencyDiagnostics>
+    <RingPreparationClaimLimit Condition="'$(RingPreparationClaimLimit)'==''">32</RingPreparationClaimLimit>
+    <RingPreparationCopyLimit Condition="'$(RingPreparationCopyLimit)'==''">1048576</RingPreparationCopyLimit>
+    <RingReadyCommitLimit Condition="'$(RingReadyCommitLimit)'==''">8</RingReadyCommitLimit>
+    <RingReadyCopyLimit Condition="'$(RingReadyCopyLimit)'==''">262144</RingReadyCopyLimit>
+    <RingPreparationTimeUs Condition="'$(RingPreparationTimeUs)'==''">100</RingPreparationTimeUs>
+  </PropertyGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
@@ -118,6 +138,11 @@
     <TargetName>$(MyBaseName)-$(PlatformTarget)</TargetName>
     <EnableInf2cat>false</EnableInf2cat>
   </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);SPD_RING_MAP_ORIGIN_DIAGNOSTICS=$(RingMapOriginDiagnostics);SPD_RING_MAP_THRESHOLD_BYTES=$(RingMapThresholdBytes);SPD_RING_THREAD_PRIORITY=$(RingThreadPriority);SPD_IOQ_QUEUED_SPIN_LOCK=$(IoqQueuedSpinLock);SPD_RING_PREPARATION_THREAD=$(RingPreparationThread);SPD_RING_PREPARATION_THREADS=$(RingPreparationThreads);SPD_RING_COMPLETION_THREADS=$(RingCompletionThreads);SPD_RING_COMPLETION_CLAIM_LIMIT=$(RingCompletionClaimLimit);SPD_RING_COMPLETION_THREAD=$(RingCompletionThread);SPD_RING_COMPLETION_DPC_MODE=$(RingCompletionDpcMode);SPD_RING_LATENCY_DIAGNOSTICS=$(RingLatencyDiagnostics);SPD_RING_CLAIM_LIMIT=$(RingPreparationClaimLimit);SPD_RING_PREPARE_COPY_LIMIT=$(RingPreparationCopyLimit);SPD_RING_READY_COMMIT_LIMIT=$(RingReadyCommitLimit);SPD_RING_READY_COPY_LIMIT=$(RingReadyCopyLimit);SPD_RING_PREPARE_TIME_US=$(RingPreparationTimeUs)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <AdditionalIncludeDirectories>..\..\src;..\..\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -180,7 +205,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Platform)'=='ARM64'">
     <ClCompile>
-      <PreprocessorDefinitions>%(PreprocessorDefinitions);NTDDI_VERSION=0x0A000008;_WIN32_WINNT=0x0A00;STOR_ADDRESS_TYPE_NVME=0x2</PreprocessorDefinitions>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);NTDDI_VERSION=$(RingTargetNtddi);_WIN32_WINNT=0x0A00;STOR_ADDRESS_TYPE_NVME=0x2</PreprocessorDefinitions>
       <AdditionalIncludeDirectories>..\..\src;..\..\inc;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>

@@ -347,7 +347,9 @@ DWORD SpdStorageUnitOpenSharedRing(SPD_STORAGE_UNIT *StorageUnit,
         return ERROR_INVALID_DATA;
     }
     if (0 != SpdRingLoadAcquire32(&Header->RequestHead.Value) ||
-        0 != SpdRingLoadAcquire32(&Header->RequestTail.Value) ||
+        /* Discovery SRBs can publish after the kernel commits OPEN, before
+         * this caller resumes. No userspace consumer has advanced the head. */
+        Header->QueueDepth < SpdRingLoadAcquire32(&Header->RequestTail.Value) ||
         0 != SpdRingLoadAcquire32(&Header->CompletionHead.Value) ||
         0 != SpdRingLoadAcquire32(&Header->CompletionTail.Value))
     {
@@ -713,12 +715,22 @@ static BOOLEAN SpdRingValidateRequestData(
     if (!NeedsBuffer)
     {
         *PDataBuffer = 0;
-        return SPD_RING_NO_BUFFER == Data->BufferId &&
+        return 0 == Data->UserAddress && SPD_RING_NO_BUFFER == Data->BufferId &&
             0 == Data->Length;
     }
 
     if (SPD_RING_NO_BUFFER == Data->BufferId)
         return FALSE;
+    if (0 != Data->UserAddress)
+    {
+        if (Data->BufferId >= Runtime->BufferCount ||
+            (SpdIoctlTransactReadKind != Request->Kind && SpdIoctlTransactWriteKind != Request->Kind) ||
+            Data->UserAddress != (UINT64)(UINT_PTR)Data->UserAddress ||
+            Data->UserAddress + Data->Length < Data->UserAddress)
+            return FALSE;
+        *PDataBuffer = (PVOID)(UINT_PTR)Data->UserAddress;
+        return TRUE;
+    }
     *PDataBuffer = SpdRingBufferAddress(Runtime, Data->BufferId,
         Data->Length);
     return 0 != *PDataBuffer;
@@ -1036,8 +1048,9 @@ static VOID SpdRingConsumeRequests(
         SPD_RING_REQUEST Entry =
             RequestRing[Head & (Runtime->QueueDepth - 1)];
         SPD_RING_USER_ITEM *Item;
-        PVOID DataBuffer = SpdRingBufferAddress(Runtime,
-            Entry.Data.BufferId, Entry.Data.Length);
+        PVOID DataBuffer = 0 != Entry.Data.UserAddress ?
+            (PVOID)(UINT_PTR)Entry.Data.UserAddress : SpdRingBufferAddress(Runtime,
+                Entry.Data.BufferId, Entry.Data.Length);
 
         Item = CONTAINING_RECORD(
             SpdRingListRemoveHead(&Runtime->FreeItems),

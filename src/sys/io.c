@@ -165,14 +165,14 @@ UCHAR SpdSrbResetLogicalUnit(PVOID DeviceExtension, PVOID Srb)
 
 UCHAR SpdSrbFlush(PVOID DeviceExtension, PVOID Srb)
 {
-    /* must have already received SYNCHRONIZE CACHE; just return SUCCESS */
-    return SRB_STATUS_SUCCESS;
+    return SpdSrbPostFlush(DeviceExtension, Srb);
 }
 
 UCHAR SpdSrbShutdown(PVOID DeviceExtension, PVOID Srb)
 {
-    /* our user mode process must be gone; just return SUCCESS */
-    return SRB_STATUS_SUCCESS;
+    /* SHUTDOWN can arrive more than once while I/O is still active. It must
+     * execute its own ordered backend flush rather than assume an earlier one. */
+    return SpdSrbPostFlush(DeviceExtension, Srb);
 }
 
 UCHAR SpdSrbPnp(PVOID DeviceExtension, PVOID Srb)

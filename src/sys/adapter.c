@@ -21,6 +21,54 @@
 
 #include <sys/driver.h>
 
+/* Query support rather than assuming physical-HBA performance options apply
+ * to a virtual adapter. Mode 0 preserves Storport's defaults; modes 1/2 opt
+ * into completion DPC redirection, optionally toward the completing CPU. */
+#ifndef SPD_RING_COMPLETION_DPC_MODE
+#define SPD_RING_COMPLETION_DPC_MODE 0
+#endif
+#if SPD_RING_COMPLETION_DPC_MODE < 0 || SPD_RING_COMPLETION_DPC_MODE > 2
+#error Completion DPC mode must be 0 (default), 1 (origin CPU), or 2 (current CPU).
+#endif
+static VOID SpdInitializeCompletionPerf(SPD_DEVICE_EXTENSION *DeviceExtension)
+{
+    PERF_CONFIGURATION_DATA Perf;
+    ULONG QueryStatus = STOR_STATUS_NOT_IMPLEMENTED;
+    DeviceExtension->CompletionPerfMode = SPD_RING_COMPLETION_DPC_MODE;
+    DeviceExtension->CompletionPerfApplyStatus = STOR_STATUS_NOT_IMPLEMENTED;
+    /* An older OS may understand fewer PERF_CONFIGURATION_DATA versions. */
+    for (ULONG Version = STOR_PERF_VERSION; Version >= STOR_PERF_VERSION_2; Version--)
+    {
+        RtlZeroMemory(&Perf, sizeof Perf);
+        Perf.Version = Version;
+        Perf.Size = sizeof Perf;
+        QueryStatus = StorPortInitializePerfOpts(DeviceExtension, TRUE, &Perf);
+        if (STOR_STATUS_SUCCESS == QueryStatus)
+            break;
+    }
+    DeviceExtension->CompletionPerfQueryStatus = QueryStatus;
+    if (STOR_STATUS_SUCCESS != QueryStatus)
+        return; /* Optional tuning must never prevent adapter startup. */
+    DeviceExtension->CompletionPerfVersion = Perf.Version;
+    DeviceExtension->CompletionPerfSupported = Perf.Flags;
+#if SPD_RING_COMPLETION_DPC_MODE != 0
+    ULONG Desired = STOR_PERF_DPC_REDIRECTION;
+#if SPD_RING_COMPLETION_DPC_MODE == 2
+    Desired |= STOR_PERF_DPC_REDIRECTION_CURRENT_CPU;
+#endif
+    DeviceExtension->CompletionPerfRequested = Desired;
+    if ((Perf.Flags & Desired) != Desired)
+        return;
+    /* Do not enable concurrent StartIo, interrupt routing, or any unrelated
+     * optimization simply because the support query advertises it. */
+    Perf.Flags = Desired;
+    DeviceExtension->CompletionPerfApplyStatus =
+        StorPortInitializePerfOpts(DeviceExtension, FALSE, &Perf);
+    if (STOR_STATUS_SUCCESS == DeviceExtension->CompletionPerfApplyStatus)
+        DeviceExtension->CompletionPerfApplied = Desired;
+#endif
+}
+
 ULONG SpdHwFindAdapter(
     PVOID DeviceExtension0,
     PVOID HwContext,
@@ -71,6 +119,8 @@ BOOLEAN SpdHwInitialize(PVOID DeviceExtension)
 {
     BOOLEAN Result = TRUE;
     SPD_ENTER(adapter);
+
+    SpdInitializeCompletionPerf(DeviceExtension);
 
     SPD_LEAVE(adapter,
         "%p", " = %d",

@@ -43,6 +43,82 @@ static UCHAR SpdScsiErrorEx(PVOID Srb,
 static VOID SpdCdbGetRange(PCDB Cdb,
     PUINT64 POffset, PUINT32 PLength, PUINT32 PForceUnitAccess);
 
+BOOLEAN SpdSrbIsFlush(PVOID Srb)
+{
+    ULONG Function = SrbGetSrbFunction(Srb);
+    if (SRB_FUNCTION_FLUSH == Function || SRB_FUNCTION_SHUTDOWN == Function)
+        return TRUE;
+    if (SRB_FUNCTION_EXECUTE_SCSI != Function)
+        return FALSE;
+    UCHAR Operation = SrbGetCdb(Srb)->AsByte[0];
+    return SCSIOP_SYNCHRONIZE_CACHE == Operation || SCSIOP_SYNCHRONIZE_CACHE16 == Operation;
+}
+
+UCHAR SpdSrbPostFlush(PVOID DeviceExtension, PVOID Srb)
+{
+    SPD_STORAGE_UNIT *StorageUnit = SpdStorageUnitReference(DeviceExtension, Srb);
+    if (0 == StorageUnit)
+        return SRB_STATUS_NO_DEVICE;
+    UCHAR Status = SpdScsiPostSrb(DeviceExtension, StorageUnit, Srb, 0);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+    return Status;
+}
+
+#if defined(WINSPD_TEST_BUILD)
+BOOLEAN SpdSrbTestMatchesRange(PVOID Srb, UINT32 Kind, UINT64 BlockAddress)
+{
+    UINT64 Address;
+    UINT32 ActualKind;
+    PCDB Cdb;
+    if (SRB_FUNCTION_EXECUTE_SCSI != SrbGetSrbFunction(Srb))
+        return FALSE;
+    Cdb = SrbGetCdb(Srb);
+    switch (Cdb->AsByte[0])
+    {
+    case SCSIOP_READ6: case SCSIOP_READ: case SCSIOP_READ12: case SCSIOP_READ16:
+        ActualKind = SpdIoctlTransactReadKind;
+        break;
+    case SCSIOP_WRITE6: case SCSIOP_WRITE: case SCSIOP_WRITE12: case SCSIOP_WRITE16:
+        ActualKind = SpdIoctlTransactWriteKind;
+        break;
+    case SCSIOP_SYNCHRONIZE_CACHE: case SCSIOP_SYNCHRONIZE_CACHE16:
+        ActualKind = SpdIoctlTransactFlushKind;
+        break;
+    default:
+        return FALSE;
+    }
+    SpdCdbGetRange(Cdb, &Address, 0, 0);
+    return ActualKind == Kind && Address == BlockAddress;
+}
+/* Pure preparation/completion checks: these local SRBs are never queued or
+ * submitted to Storport notification, and deliberately contain no valid CDB. */
+NTSTATUS SpdSrbTestNonCdbHelpers(SPD_STORAGE_UNIT *StorageUnit)
+{
+    for (UINT32 I = 0; I < 2; I++)
+    {
+        SCSI_REQUEST_BLOCK Srb = { 0 };
+        SPD_SRB_EXTENSION Extension = { 0 };
+        SPD_IOCTL_TRANSACT_REQ Request = { 0 };
+        SPD_IOCTL_TRANSACT_RSP Response = { 0 };
+        Srb.Length = sizeof Srb;
+        Srb.Function = 0 == I ? SRB_FUNCTION_FLUSH : SRB_FUNCTION_SHUTDOWN;
+        Extension.Srb = &Srb;
+        Extension.StorageUnit = StorageUnit;
+        if (!SpdSrbIsFlush(&Srb) || 0 != SpdSrbPreparationCopyBytes(&Extension))
+            return STATUS_DATA_ERROR;
+        SpdSrbExecuteScsiPrepare(&Extension, &Request, 0);
+        if (SpdIoctlTransactFlushKind != Request.Kind || 0 == Request.Hint ||
+            0 != Request.Op.Flush.BlockAddress || 0 != Request.Op.Flush.BlockCount ||
+            SRB_STATUS_SUCCESS != SpdSrbExecuteScsiComplete(&Extension, &Response, 0))
+            return STATUS_DATA_ERROR;
+        Response.Status.ScsiStatus = SCSISTAT_CHECK_CONDITION;
+        if (SRB_STATUS_ERROR != SpdSrbExecuteScsiComplete(&Extension, &Response, 0))
+            return STATUS_DATA_ERROR;
+    }
+    return STATUS_SUCCESS;
+}
+#endif
+
 #define SpdScsiError(S,K,A)             SpdScsiErrorEx(S,K,A,0,0)
 
 UCHAR SpdSrbExecuteScsi(PVOID DeviceExtension, PVOID Srb)
@@ -582,6 +658,7 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
     UINT64 BlockAddress, EndBlockAddress;
     UINT32 BlockCount;
     ULONG DataLength;
+    BOOLEAN Flush = FALSE;
 
     switch (Cdb->AsByte[0])
     {
@@ -615,6 +692,7 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
             return SpdScsiError(Srb, SCSI_SENSE_DATA_PROTECT, SCSI_ADSENSE_WRITE_PROTECT);
         SpdCdbGetRange(Cdb, &BlockAddress, &BlockCount, 0);
         DataLength = 0;
+        Flush = TRUE;
         break;
 
     default:
@@ -622,11 +700,15 @@ static UCHAR SpdScsiPostRangeSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *Storag
         return SRB_STATUS_INVALID_REQUEST;
     }
 
-    if (0 == BlockCount)
+    if (!Flush && 0 == BlockCount)
         return SRB_STATUS_SUCCESS;
 
+    /* A zero-count SYNCHRONIZE CACHE covers LBA through the end of the
+     * medium; it is not an empty transfer. Preserve the zero count in the
+     * backend request rather than expanding it into a possibly >32-bit range. */
     EndBlockAddress = BlockAddress + BlockCount;
-    if (EndBlockAddress < BlockAddress ||
+    if ((Flush && BlockAddress >= StorageUnit->StorageUnitParams.BlockCount) ||
+        EndBlockAddress < BlockAddress ||
         EndBlockAddress > StorageUnit->StorageUnitParams.BlockCount)
         return SpdScsiError(Srb, SCSI_SENSE_ILLEGAL_REQUEST, SCSI_ADSENSE_ILLEGAL_BLOCK);
 
@@ -707,10 +789,106 @@ static UCHAR SpdScsiPostSrb(PVOID DeviceExtension, SPD_STORAGE_UNIT *StorageUnit
             return SRB_STATUS_INTERNAL_ERROR;
         }
         SrbExtension->SystemDataLength = DataLength;
+#if SPD_RING_MAP_THRESHOLD_BYTES || SPD_RING_MAP_ORIGIN_DIAGNOSTICS
+        if (DataLength >= (SPD_RING_MAP_THRESHOLD_BYTES ? SPD_RING_MAP_THRESHOLD_BYTES : 65536) &&
+            SRB_FUNCTION_EXECUTE_SCSI == SrbGetSrbFunction(Srb))
+        {
+            UCHAR Op = SrbGetCdb(Srb)->AsByte[0];
+            if (SCSIOP_READ6 == Op || SCSIOP_READ == Op ||
+                SCSIOP_READ12 == Op || SCSIOP_READ16 == Op ||
+                SCSIOP_WRITE6 == Op || SCSIOP_WRITE == Op ||
+                SCSIOP_WRITE12 == Op || SCSIOP_WRITE16 == Op)
+            {
+                PVOID Mdl = 0;
+                STOR_REQUEST_INFO Info = { 0 };
+                Info.Version = STOR_REQUEST_INFO_VER_2;
+                Info.Size = sizeof Info;
+                /* A backend issuing I/O to its own virtual disk can otherwise
+                 * deadlock process exit: its SRB waits for backend quiescence,
+                 * while process exit waits for that same SRB. Unknown origins
+                 * also retain the copy path. */
+                ULONG InfoStatus = StorPortGetRequestInfo(DeviceExtension, Srb, &Info);
+                ULONG MdlStatus = StorPortGetOriginalMdl(DeviceExtension, Srb, &Mdl);
+                BOOLEAN UserRange = FALSE;
+                if (STOR_STATUS_SUCCESS == MdlStatus && 0 != Mdl)
+                {
+                    UINT_PTR Address = (UINT_PTR)MmGetMdlVirtualAddress((PMDL)Mdl);
+                    ULONG Bytes = MmGetMdlByteCount((PMDL)Mdl);
+                    UserRange = 0 != Address && 0 != Bytes &&
+                        Address <= (UINT_PTR)MmHighestUserAddress &&
+                        Bytes - 1 <= (UINT_PTR)MmHighestUserAddress - Address;
+                }
+#if SPD_RING_MAP_ORIGIN_DIAGNOSTICS
+                SPD_RING_STATE *Ring = &StorageUnit->Ring;
+                LONG64 Sample = InterlockedIncrement64(&Ring->MapOriginSamples);
+                if (STOR_STATUS_SUCCESS != MdlStatus || 0 == Mdl)
+                    InterlockedIncrement64(&Ring->MapOriginUnknown);
+                else if (UserRange)
+                    InterlockedIncrement64(&Ring->MapOriginUser);
+                else
+                    InterlockedIncrement64(&Ring->MapOriginKernel);
+                if (STOR_STATUS_SUCCESS == InfoStatus && Info.ProcessId == StorageUnit->TransactProcessId)
+                    InterlockedIncrement64(&Ring->MapOriginSelf);
+                if (Sample <= 8)
+                    DbgPrint(DRIVER_NAME ": SharedRing mapping-origin bytes=%lu user_range=%u mdl_status=%lu mdl_flags=%x info_status=%lu requester=%lu backend=%lu\n",
+                        DataLength, (unsigned)UserRange, MdlStatus,
+                        0 != Mdl && STOR_STATUS_SUCCESS == MdlStatus ? ((PMDL)Mdl)->MdlFlags : 0,
+                        InfoStatus, Info.ProcessId, StorageUnit->TransactProcessId);
+#endif
+#if SPD_RING_MAP_THRESHOLD_BYTES
+                if (UserRange &&
+                    STOR_STATUS_SUCCESS == InfoStatus &&
+                    0 != Info.ProcessId && MAXULONG != Info.ProcessId &&
+                    Info.ProcessId != StorageUnit->TransactProcessId &&
+                    STOR_STATUS_SUCCESS == MdlStatus &&
+                    0 != Mdl)
+                {
+                    SrbExtension->OriginalMdl = Mdl;
+                    SrbExtension->MappingCandidate = TRUE;
+                }
+#endif
+            }
+        }
+#endif
     }
 
     Result = SpdIoqPostSrb(StorageUnit, Srb);
-    return NT_SUCCESS(Result) ? SRB_STATUS_PENDING : SRB_STATUS_ABORTED;
+    if (NT_SUCCESS(Result))
+        return SRB_STATUS_PENDING;
+    return STATUS_DEVICE_NOT_CONNECTED == Result ? SRB_STATUS_NO_DEVICE : SRB_STATUS_ABORTED;
+}
+
+static ULONG SpdSrbChunkLength(SPD_SRB_EXTENSION *Extension)
+{
+    ULONG Length = min(Extension->SystemDataLength - Extension->ChunkOffset,
+        Extension->StorageUnit->StorageUnitParams.MaxTransferLength);
+#if defined(WINSPD_TEST_BUILD)
+    if (0 != Extension->StorageUnit->TestChunkLimit)
+        Length = min(Length, Extension->StorageUnit->TestChunkLimit);
+#endif
+    return Length;
+}
+
+/* Estimate only bytes copied by preparation, never the READ payload. Called
+ * under the metadata lock before claim and by the exclusive preparation owner. */
+UINT32 SpdSrbPreparationCopyBytes(SPD_SRB_EXTENSION *Extension)
+{
+    if (SRB_FUNCTION_EXECUTE_SCSI != SrbGetSrbFunction(Extension->Srb))
+        return 0;
+    PCDB Cdb = SrbGetCdb(Extension->Srb);
+    switch (Cdb->AsByte[0])
+    {
+    case SCSIOP_WRITE6:
+    case SCSIOP_WRITE:
+    case SCSIOP_WRITE12:
+    case SCSIOP_WRITE16:
+        return SpdSrbChunkLength(Extension);
+    case SCSIOP_UNMAP:
+        return Extension->SystemDataLength / sizeof(UNMAP_BLOCK_DESCRIPTOR) *
+            sizeof(SPD_IOCTL_UNMAP_DESCRIPTOR);
+    default:
+        return 0;
+    }
 }
 
 VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuffer)
@@ -725,6 +903,15 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
     UINT32 ForceUnitAccess;
     ULONG ChunkLength;
 
+    if (SRB_FUNCTION_FLUSH == SrbGetSrbFunction(Srb) ||
+        SRB_FUNCTION_SHUTDOWN == SrbGetSrbFunction(Srb))
+    {
+        Req->Hint = (UINT64)(UINT_PTR)SrbExtension;
+        Req->Kind = SpdIoctlTransactFlushKind;
+        Req->Op.Flush.BlockAddress = 0;
+        Req->Op.Flush.BlockCount = 0;
+        return;
+    }
     Cdb = SrbGetCdb(Srb);
     switch (Cdb->AsByte[0])
     {
@@ -740,9 +927,7 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
             &ForceUnitAccess);
         Req->Op.Read.ForceUnitAccess =
             StorageUnit->StorageUnitParams.CacheSupported ? ForceUnitAccess : 1;
-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
+        ChunkLength = SpdSrbChunkLength(SrbExtension);
         Req->Op.Read.BlockAddress +=
             SrbExtension->ChunkOffset / StorageUnit->StorageUnitParams.BlockLength;
         Req->Op.Read.BlockCount =
@@ -763,16 +948,15 @@ VOID SpdSrbExecuteScsiPrepare(PVOID SrbExtension0, PVOID Context, PVOID DataBuff
             StorageUnit->StorageUnitParams.CacheSupported &&
             StorageUnit->StorageUnitParams.FuaSupported ? ForceUnitAccess :
             !StorageUnit->StorageUnitParams.CacheSupported;
-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
+        ChunkLength = SpdSrbChunkLength(SrbExtension);
         Req->Op.Write.BlockAddress +=
             SrbExtension->ChunkOffset / StorageUnit->StorageUnitParams.BlockLength;
         Req->Op.Write.BlockCount =
             ChunkLength / StorageUnit->StorageUnitParams.BlockLength;
         SpdStorageUnitRingTestPrepareCopyBarrier(StorageUnit);
-        RtlCopyMemory(DataBuffer,
-            (PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset, ChunkLength);
+        if (DataBuffer != (PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset)
+            RtlCopyMemory(DataBuffer,
+                (PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset, ChunkLength);
         return;
 
     case SCSIOP_SYNCHRONIZE_CACHE:
@@ -822,11 +1006,15 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
     ASSERT(DISPATCH_LEVEL >= KeGetCurrentIrql());
 
     SPD_SRB_EXTENSION *SrbExtension = SrbExtension0;
-    SPD_STORAGE_UNIT *StorageUnit = SrbExtension->StorageUnit;
     SPD_IOCTL_TRANSACT_RSP *Rsp = Context;
     PVOID Srb = SrbExtension->Srb;
     PCDB Cdb;
     ULONG ChunkLength;
+
+    /* Non-CDB SRBs have no valid CDB or execute-SCSI sense extension. */
+    if (SRB_FUNCTION_FLUSH == SrbGetSrbFunction(Srb) ||
+        SRB_FUNCTION_SHUTDOWN == SrbGetSrbFunction(Srb))
+        return SCSISTAT_GOOD == Rsp->Status.ScsiStatus ? SRB_STATUS_SUCCESS : SRB_STATUS_ERROR;
 
     if (SCSISTAT_GOOD != Rsp->Status.ScsiStatus)
         return SpdScsiErrorEx(Srb,
@@ -842,11 +1030,11 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
     case SCSIOP_READ:
     case SCSIOP_READ12:
     case SCSIOP_READ16:
-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
-        SpdStorageUnitRingTestCompletionCopyBarrier(StorageUnit);
-        if (0 != DataBuffer)
+        ChunkLength = SpdSrbChunkLength(SrbExtension);
+        SpdStorageUnitRingTestCompletionCopyBarrier(SrbExtension->StorageUnit);
+        if (DataBuffer == (PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset)
+            ; /* Backend filled the SRB pages through their user mapping. */
+        else if (0 != DataBuffer)
             RtlCopyMemory((PUINT8)SrbExtension->SystemDataBuffer + SrbExtension->ChunkOffset,
                 DataBuffer, ChunkLength);
         else
@@ -861,9 +1049,7 @@ UCHAR SpdSrbExecuteScsiComplete(PVOID SrbExtension0, PVOID Context, PVOID DataBu
     case SCSIOP_WRITE:
     case SCSIOP_WRITE12:
     case SCSIOP_WRITE16:
-        ChunkLength = SrbExtension->SystemDataLength - SrbExtension->ChunkOffset;
-        if (ChunkLength > StorageUnit->StorageUnitParams.MaxTransferLength)
-            ChunkLength = StorageUnit->StorageUnitParams.MaxTransferLength;
+        ChunkLength = SpdSrbChunkLength(SrbExtension);
         SrbExtension->ChunkOffset += ChunkLength;
         /* if we are done return SUCCESS; if we have more chunks return PENDING */
         return SrbExtension->ChunkOffset >= SrbExtension->SystemDataLength ?

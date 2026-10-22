@@ -326,7 +326,7 @@ static VOID SpdIoctlRingOpen(SPD_DEVICE_EXTENSION *DeviceExtension,
     else
     {
         Irp->IoStatus.Status = SpdStorageUnitRingOpen(StorageUnit,
-            ProcessId, Params);
+            ProcessId, IoGetCurrentIrpStackLocation(Irp)->FileObject, Params);
         if (NT_SUCCESS(Irp->IoStatus.Status))
             Irp->IoStatus.Information = sizeof *Params;
     }
@@ -348,10 +348,16 @@ static VOID SpdIoctlRingClose(SPD_DEVICE_EXTENSION *DeviceExtension,
         goto exit;
     }
 
-    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    StorageUnit = SpdStorageUnitReferenceForClose(DeviceExtension, Params->Btl);
     if (0 == StorageUnit)
     {
         Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    if (StorageUnit->RingFileObject != IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
         goto exit;
     }
 
@@ -391,6 +397,12 @@ static VOID SpdIoctlRingStop(SPD_DEVICE_EXTENSION *DeviceExtension,
         goto exit;
     }
 
+    if (StorageUnit->RingFileObject != IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+        goto exit;
+    }
+
     Irp->IoStatus.Status = SpdStorageUnitRingStop(StorageUnit, ProcessId);
 
 exit:;
@@ -417,6 +429,12 @@ static SPD_SERVICE_IRP_DISPOSITION SpdIoctlRingWait(SPD_DEVICE_EXTENSION *Device
     if (0 == StorageUnit)
     {
         Irp->IoStatus.Status = STATUS_CANCELLED;
+        goto exit;
+    }
+
+    if (StorageUnit->RingFileObject != IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
         goto exit;
     }
 
@@ -457,6 +475,12 @@ static VOID SpdIoctlRingKick(SPD_DEVICE_EXTENSION *DeviceExtension,
         goto exit;
     }
 
+    if (StorageUnit->RingFileObject != IoGetCurrentIrpStackLocation(Irp)->FileObject)
+    {
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+        goto exit;
+    }
+
     Irp->IoStatus.Status = SpdStorageUnitRingKick(StorageUnit,
         ProcessId, Params);
     if (NT_SUCCESS(Irp->IoStatus.Status))
@@ -466,6 +490,60 @@ exit:;
     if (0 != StorageUnit)
         SpdStorageUnitDereference(DeviceExtension, StorageUnit);
 }
+
+#if defined(WINSPD_TEST_BUILD)
+static VOID SpdIoctlTestCancel(SPD_DEVICE_EXTENSION *DeviceExtension,
+    ULONG InputBufferLength, SPD_IOCTL_TEST_CANCEL_PARAMS *Params, PIRP Irp)
+{
+    SPD_STORAGE_UNIT *StorageUnit;
+    if (InputBufferLength < sizeof *Params)
+    {
+        Irp->IoStatus.Status = STATUS_INVALID_PARAMETER;
+        return;
+    }
+    StorageUnit = SpdStorageUnitReferenceByBtl(DeviceExtension, Params->Btl);
+    if (0 == StorageUnit)
+    {
+        Irp->IoStatus.Status = STATUS_CANCELLED;
+        return;
+    }
+    if (IoGetRequestorProcessId(Irp) != StorageUnit->TransactProcessId)
+        Irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+    else if (SPD_IOCTL_TEST_EXHAUST_GENERATION == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestExhaustGeneration(StorageUnit->Ioq);
+    else if (SPD_IOCTL_TEST_PROMOTE_FLUSH == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestPromoteFlush(StorageUnit->Ioq, Params->BlockAddress);
+    else if (SPD_IOCTL_TEST_NONCDB_HELPERS == Params->Base.Code)
+        Irp->IoStatus.Status = SpdSrbTestNonCdbHelpers(StorageUnit);
+    else if (SPD_IOCTL_TEST_NONCDB_SEEN == Params->Base.Code)
+        Irp->IoStatus.Status = 0 != InterlockedCompareExchange64(
+            &StorageUnit->Ring.NonCdbFlushSubmissions, 0, 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    else if (SPD_IOCTL_TEST_EXPECT_CHUNKED == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestExpectChunked(StorageUnit->Ioq, Params->BlockAddress);
+    else if (SPD_IOCTL_TEST_LEGACY_CHUNKS == Params->Base.Code)
+        Irp->IoStatus.Status = 0 < InterlockedCompareExchange(
+            &StorageUnit->TestLegacyContinuations, 0, 0) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+    else if (SPD_IOCTL_TEST_COPY_BUDGET == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestCopyBudget(StorageUnit->Ioq);
+    else if (SPD_IOCTL_TEST_CHUNK_LIMIT == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestSetChunkLimit(StorageUnit->Ioq, Params->ExpectedState);
+    else if (SPD_IOCTL_TEST_EXPECT_PENDING == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestExpectPending(StorageUnit->Ioq, Params->Kind, Params->BlockAddress);
+    else if (SPD_IOCTL_TEST_EXPECT_FENCE == Params->Base.Code)
+        Irp->IoStatus.Status = SpdIoqTestExpectFence(StorageUnit->Ioq);
+    else if (SPD_IOCTL_TEST_RESET == Params->Base.Code)
+    {
+        /* Exercise the same IOQ reset as SRB_FUNCTION_RESET_DEVICE. The disk
+         * class IOCTL_STORAGE_RESET_DEVICE path is unsupported on some hosts. */
+        SpdIoqReset(StorageUnit->Ioq, FALSE, SpdIoqResetReasonDeviceReset);
+        Irp->IoStatus.Status = STATUS_SUCCESS;
+    }
+    else
+        Irp->IoStatus.Status = SpdIoqTestCancel(StorageUnit->Ioq,
+            Params->Kind, Params->BlockAddress, Params->ExpectedState);
+    SpdStorageUnitDereference(DeviceExtension, StorageUnit);
+}
+#endif
 
 VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
 {
@@ -489,6 +567,22 @@ VOID SpdHwProcessServiceRequest(PVOID DeviceExtension, PVOID Irp0)
 
     switch (((SPD_IOCTL_BASE_PARAMS *)Params)->Code)
     {
+#if defined(WINSPD_TEST_BUILD)
+    case SPD_IOCTL_TEST_CANCEL:
+    case SPD_IOCTL_TEST_RESET:
+    case SPD_IOCTL_TEST_EXHAUST_GENERATION:
+    case SPD_IOCTL_TEST_PROMOTE_FLUSH:
+    case SPD_IOCTL_TEST_NONCDB_HELPERS:
+    case SPD_IOCTL_TEST_NONCDB_SEEN:
+    case SPD_IOCTL_TEST_EXPECT_CHUNKED:
+    case SPD_IOCTL_TEST_LEGACY_CHUNKS:
+    case SPD_IOCTL_TEST_COPY_BUDGET:
+    case SPD_IOCTL_TEST_CHUNK_LIMIT:
+    case SPD_IOCTL_TEST_EXPECT_PENDING:
+    case SPD_IOCTL_TEST_EXPECT_FENCE:
+        SpdIoctlTestCancel(DeviceExtension, InputBufferLength, Params, Irp);
+        break;
+#endif
     case SPD_IOCTL_PROVISION:
         SpdIoctlProvision(DeviceExtension, InputBufferLength, OutputBufferLength, Params, Irp);
         break;

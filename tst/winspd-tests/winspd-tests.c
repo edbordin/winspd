@@ -24,6 +24,7 @@
 #include <tlib/testsuite.h>
 
 static void exiting(void);
+void ring_tests_cleanup(void);
 
 static void abort_handler(int sig)
 {
@@ -55,5 +56,6 @@ int main(int argc, char *argv[])
 
 static void exiting(void)
 {
+    ring_tests_cleanup();
     OutputDebugStringA("winspd-tests: exiting\n");
 }

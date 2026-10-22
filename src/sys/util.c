@@ -125,3 +125,39 @@ NTSTATUS SpdGetScsiAddress(
 
     return STATUS_SUCCESS;
 }
+
+/* Emit after worker rundown. Percentiles are the upper endpoint of the bin,
+ * in QPC ticks; retain the clock frequency so parsers can convert to time. */
+VOID SpdHistogramLog(const SPD_HISTOGRAM *Histogram, PCSTR Name)
+{
+    UINT64 Count = 0, Cumulative = 0, P50 = 0, P99 = 0;
+    LARGE_INTEGER Frequency;
+    for (ULONG I = 0; I < SPD_HISTOGRAM_BUCKETS; I++)
+        Count += Histogram->Bins[I];
+    UINT64 Rank50 = Count / 2 + (Count % 2 != 0);
+    UINT64 Rank99 = Count - Count / 100;
+    for (ULONG I = 0; I < SPD_HISTOGRAM_BUCKETS && 0 != Count; I++)
+    {
+        Cumulative += Histogram->Bins[I];
+        if (0 == P50 && Cumulative >= Rank50)
+            P50 = 1ULL << I;
+        if (Cumulative >= Rank99)
+        {
+            P99 = 1ULL << I;
+            break;
+        }
+    }
+    (void)KeQueryPerformanceCounter(&Frequency);
+    DbgPrint(DRIVER_NAME ": histogram name=%s count=%I64u p50_ticks=%I64u p99_ticks=%I64u qpc_hz=%I64d\n",
+        Name, Count, P50, P99, Frequency.QuadPart);
+}
+
+/* Called only after rundown, like the existing histogram dump. */
+VOID SpdLatencyLog(const SPD_LATENCY_METRIC *Metric, PCSTR Name, BOOLEAN IsDepth)
+{
+    LARGE_INTEGER Frequency;
+    (void)KeQueryPerformanceCounter(&Frequency);
+    DbgPrint(DRIVER_NAME ": latency_total name=%s count=%I64u total=%I64u maximum=%I64u qpc_hz=%I64d depth=%u\n",
+        Name, Metric->Count, Metric->Total, Metric->Maximum, Frequency.QuadPart, (unsigned)IsDepth);
+    SpdHistogramLog(&Metric->Histogram, Name);
+}
