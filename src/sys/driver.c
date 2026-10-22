@@ -38,6 +38,7 @@ NTSTATUS DriverEntry(
         ASSERT(PASSIVE_LEVEL == KeGetCurrentIrql()));
 
     ExInitializeResourceLite(&SpdGlobalDeviceResource);
+    KeInitializeMutex(&SpdGlobalDeviceLifecycleMutex, 0);
 
     UNICODE_STRING RegistryValueName;
     union
